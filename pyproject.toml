@@ -1,0 +1,43 @@
+[project]
+name = "supcon-adventurex-factory-sim"
+version = "1.0.0"
+description = "Backend simulation environment for the SUPCON Hackathon"
+authors = [{ name = "SUPCON R&D Team" }]
+dependencies = [
+    "simpy",
+    "paho-mqtt",
+    "pydantic",
+    "pyyaml",
+    "numpy",
+    "psutil",
+]
+requires-python = ">=3.9"
+
+# Add package configuration for proper import resolution
+[tool.setuptools]
+packages = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "."
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.uv]
+dev-dependencies = [
+    "pytest",
+]
+
+[tool.pyright]
+include = ["src"]
+exclude = ["**/__pycache__"]
+typeCheckingMode = "basic"
+
+[tool.ruff]
+line-length = 88
+select = ["E", "F", "W", "I"]
+ignore = []
+
+[tool.ruff.format]
+quote-style = "double"

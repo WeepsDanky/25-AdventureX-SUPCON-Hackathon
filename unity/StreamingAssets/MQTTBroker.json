@@ -1,0 +1,46 @@
+{
+  "tcp": {
+    "port": 1883,
+    "host": "supos-ce-instance4.supos.app",
+    "client_id": "simpy_mqtt_docker_mqtt_client",
+    "username": "",
+    "password": "",
+    "keep_alive": 60,
+    "mqtt_version": 5,
+    "connect_timeout": 30,
+    "auto_reconnect": true,
+    "reconnect_delay": 5,
+    "subscribe_broker_topic": ""
+  },
+  "ws": {
+    "port": 8083,
+    "host": "supos-ce-instance4.supos.app",
+    "client_id": "simpy_mqtt_docker_mqtt_client_ws",
+    "username": "",
+    "password": "",
+    "keep_alive": 60,
+    "mqtt_version": 5,
+    "connect_timeout": 30,
+    "auto_reconnect": true,
+    "reconnect_delay": 5,
+    "subscribe_broker_topic": ""
+  },
+  "wss": {
+    "port": 8084,
+    "host": "supos-ce-instance4.supos.app",
+    "client_id": "NLDF_TEST",
+    "username": "",
+    "password": "",
+    "keep_alive": 60,
+    "mqtt_version": 5,
+    "connect_timeout": 30,
+    "auto_reconnect": true,
+    "reconnect_delay": 5,
+    "subscribe_broker_topic": ""
+  },
+
+  "common_topic": {
+    "Root_Topic_Head": "NLDF_TEST"
+  },
+  "connect_mode": { "wss": true }
+}

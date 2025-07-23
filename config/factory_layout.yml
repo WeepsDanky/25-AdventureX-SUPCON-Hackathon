@@ -1,0 +1,203 @@
+# SUPCON Factory Layout Configuration
+# This file defines the physical layout and parameters of the factory simulation
+
+factory:
+  name: "SUPCON AdventureX NLDF"
+  description: "自然语言驱动智能制造仿真工厂"
+
+# 工站配置
+stations:
+  - id: "StationA"
+    # name: "组装工站"
+    position: [15, 20]
+    buffer_size: 3
+    processing_times: # 产品类型: [最小时间, 最大时间] (秒)
+      P1: [5, 5] #[30, 45]
+      P2: [5, 5] #[40, 60]
+      P3: [5, 5] #[35, 50]
+    interacting_points: [P1]
+
+  - id: "StationB"
+    # name: "焊接工站"
+    position: [35, 20]
+    buffer_size: 3
+    processing_times:
+      P1: [5, 5] #[45, 60]
+      P2: [5, 5] #[60, 80]
+      P3: [5, 5] #[50, 70]
+    interacting_points: [P3]
+
+  - id: "StationC"
+    # name: "测试工站"
+    position: [55, 20]
+    buffer_size: 3
+    processing_times:
+      P1: [5, 5] #[20, 30]
+      P2: [5, 5] #[30, 40]
+      P3: [5, 5] #[25, 35]
+    interacting_points: [P5]
+
+  - id: "QualityCheck"
+    # name: "质量检测站"
+    position: [75, 20]
+    buffer_size: 1
+    processing_times:
+      P1: [5, 5] #[15, 25]
+      P2: [5, 5] #[20, 30]
+      P3: [5, 5] #[20, 30]
+    output_buffer_capacity: 4
+    interacting_points: [P7, P8]
+
+# AGV配置
+agvs:
+  - id: "AGV_1"
+    position: [10, 10] # initial position
+    path_points:
+      P0: [5, 15] # raw material warehouse
+      P1: [12, 15] # StationA
+      P2: [25, 15] # Conveyor_AB
+      P3: [32, 15] # StationB
+      P4: [45, 15] # Conveyor_BC
+      P5: [52, 15] # StationC
+      P6: [65, 10] # Conveyor_CQ_lower
+      P7: [72, 15] # QualityChecker
+      P8: [80, 15] # QualityChecker_output
+      P9: [95, 15] # Warehouse
+      P10: [10, 10] # Charging Area
+    speed_mps: 2.0 # 移动速度 (米/秒)
+    payload_capacity: 2 # 最大载货数量
+    low_battery_threshold: 5.0 # 低电量阈值
+    charging_point: P10 # 充电点坐标
+    charging_speed: 3.33 # 充电速度(30秒充满)
+    battery_consumption_per_meter: 0.1 # 每米消耗0.1%电量
+    battery_consumption_per_action: 0.5 # 每次操作消耗0.5%电量
+
+  - id: "AGV_2"
+    position: [10, 30]
+    path_points:
+      P0: [5, 25]
+      P1: [12, 25]
+      P2: [25, 25]
+      P3: [32, 25]
+      P4: [45, 25]
+      P5: [52, 25]
+      P6: [65, 25]
+      P7: [72, 25]
+      P8: [80, 25]
+      P9: [95, 25]
+      P10: [10, 30]
+    speed_mps: 2.0
+    payload_capacity: 2
+    low_battery_threshold: 5.0
+    charging_point: P10
+    charging_speed: 3.33
+    battery_consumption_per_meter: 0.1
+    battery_consumption_per_action: 0.5
+
+conveyors:
+  - id: "Conveyor_AB"
+    position: [25, 20]
+    transfer_time: 5.0
+    capacity: 3
+    interacting_points: [P2]
+
+  - id: "Conveyor_BC"
+    position: [45, 20]
+    transfer_time: 5.0
+    capacity: 3
+    interacting_points: [P4]
+
+  - id: "Conveyor_CQ"
+    position: [65, 20]
+    transfer_time: 5.0
+    main_capacity: 4
+    upper_capacity: 2
+    lower_capacity: 2
+    interacting_points: [P6]
+
+warehouses:
+  - id: "RawMaterial"
+    position: [0, 20]
+    interacting_points: [P0]
+
+  - id: "Warehouse"
+    position: [95, 20]
+    interacting_points: [P9]
+
+# 订单生成器配置
+order_generator:
+  generation_interval_range: [10, 10] # 最小/最大间隔 (秒)
+  quantity_weights:
+    1: 0.40
+    2: 0.30
+    3: 0.20
+    4: 0.07
+    5: 0.03
+  product_distribution:
+    P1: 0.60
+    P2: 0.30
+    P3: 0.10
+  priority_distribution:
+    low: 0.70
+    medium: 0.25
+    high: 0.05
+  deadline_multipliers:
+    low: 3.0
+    medium: 2.0
+    high: 1.5
+  theoretical_production_times:
+    P1: 160
+    P2: 200
+    P3: 250
+
+# 故障系统参数
+fault_system:
+  fault_injection_interval: [120, 180] # 故障注入间隔 (2-3分钟)
+  auto_recovery_time: [600, 1800] # 自动恢复时间 (10-30分钟)
+  device_relationships:
+    StationA: ["StationB", "AGV_1"]
+    StationB: ["StationA", "StationC", "AGV_1", "AGV_2"]
+    StationC: ["StationB", "QualityCheck", "AGV_2"]
+    QualityCheck: ["StationC"]
+    AGV_1: ["StationA", "StationB"]
+    AGV_2: ["StationB", "StationC"]
+
+# KPI计算权重
+kpi_weights:
+  production_efficiency: 0.40 # 生产效率 40%
+  quality_cost: 0.30 # 质量与成本 30%
+  agv_efficiency: 0.30 # AGV操控效率 30%
+  
+  # 生产效率子权重 (总和应为1.0)
+  efficiency_components:
+    order_completion: 0.40    # 订单完成率权重
+    production_cycle: 0.40    # 生产周期效率权重
+    device_utilization: 0.20  # 设备利用率权重
+  
+  # 质量成本子权重 (总和应为1.0)
+  quality_cost_components:
+    first_pass_rate: 0.40     # 一次通过率权重
+    cost_efficiency: 0.60     # 成本效率权重
+  
+  # AGV效率子权重 (总和应为1.0)
+  agv_components:
+    charge_strategy: 0.30     # 充电策略效率权重
+    energy_efficiency: 0.40   # 能效比权重
+    utilization: 0.30         # AGV利用率权重
+
+# KPI成本参数
+kpi_costs:
+  material_cost_per_product:
+    P1: 10.0
+    P2: 15.0
+    P3: 20.0
+  energy_cost_per_second: 0.2
+  energy_cost_multiplier_peak: 1.5
+  maintenance_cost_base: 8.0  # ~25% of average product cost, ~80s of energy cost
+  scrap_cost_multiplier: 0.8
+
+# 系统性能参数
+system:
+  status_publish_interval: 10.0 # 状态发布间隔 (秒)
+  simulation_step_size: 0.1 # 仿真步长 (秒)
+  max_concurrent_orders: 20 # 最大并发订单数
