@@ -34,6 +34,7 @@ AGV_ROLES = {
     "AGV_1": "feeder",       # RawMaterial -> StationA
     "AGV_2": "finisher"      # QualityCheck -> Warehouse
 }
+JOB_TIMEOUT_SECONDS = 120  # 2 minutes
 
 class TaskScheduler:
     """
@@ -115,9 +116,9 @@ class TaskScheduler:
     def handle_agv_status(self, line_id: str, agv_id: str, payload: Dict[str, Any]):
         """Updates AGV state and triggers scheduling or next job step."""
         full_agv_id = f"{line_id}_{agv_id}"
-        old_state = self.agv_states.get(full_agv_id, {})
         new_status = payload.get("status")
         
+        # Update the state regardless of changes
         self.agv_states[full_agv_id] = {
             "status": new_status,
             "current_point": payload.get("current_point"),
@@ -127,10 +128,13 @@ class TaskScheduler:
             "role": AGV_ROLES.get(agv_id)
         }
         
-        if (old_state.get("status") != "idle" and new_status == "idle") or (not old_state and new_status == "idle"):
+        # If the AGV is idle, it's ready for its next instruction or a new job.
+        if new_status == "idle":
             logger.info(f"AGV {full_agv_id} is now idle at {payload.get('current_point')}. Checking for work.")
-            if full_agv_id in self.agv_jobs: self.execute_next_step(full_agv_id)
-            else: self.schedule_tasks()
+            if full_agv_id in self.agv_jobs:
+                self.execute_next_step(full_agv_id)
+            else:
+                self.schedule_tasks()
 
     def add_task(self, product_id: str, from_loc: str, to_loc: str, line_id: Optional[str] = None):
         """Adds a new task to the appropriate role-based queue."""
@@ -172,7 +176,8 @@ class TaskScheduler:
                 self.agv_jobs[agv_id] = {
                     "products": task_products,
                     "from": from_loc, "to": to_loc,
-                    "step": "start"
+                    "step": "start",
+                    "last_updated": time.time()  # Add timestamp tracking
                 }
                 logger.info(f"【任务分配】AGV {agv_id} ({role}) 分配到任务: 运送 {len(task_products)} 个产品 ({', '.join(task_products)}) 从 {from_loc} 到 {to_loc}")
                 self.execute_next_step(agv_id)
@@ -220,6 +225,43 @@ class TaskScheduler:
                 for pid in products: self.tasks_created_for_product.discard(pid)
                 del self.agv_jobs[full_agv_id]
                 self.schedule_tasks()
+        
+        # Update timestamp for job progress tracking
+        if full_agv_id in self.agv_jobs:
+            self.agv_jobs[full_agv_id]["last_updated"] = time.time()
+
+    def cleanup_stuck_jobs(self):
+        """Finds and cleans up jobs that have been stuck for too long."""
+        now = time.time()
+        stuck_agvs = [
+            agv_id for agv_id, job in self.agv_jobs.items()
+            if now - job.get("last_updated", now) > JOB_TIMEOUT_SECONDS
+        ]
+
+        for agv_id in stuck_agvs:
+            job = self.agv_jobs[agv_id]
+            logger.warning(f"【任务超时】AGV {agv_id} 任务卡住，正在清理。Job: {job}")
+
+            # Safely get line_id and role for rescheduling
+            state = self.agv_states.get(agv_id)
+            if not state:
+                logger.error(f"无法为 AGV {agv_id} 找到状态，无法重新调度产品。")
+                continue
+            
+            line_id = state.get("line_id")
+            role = state.get("role")
+
+            # Re-add products to the front of the appropriate task queue
+            for product_id in job.get("products", []):
+                self.tasks_created_for_product.discard(product_id)
+                if role == "feeder" and line_id in self.feeder_tasks:
+                    self.feeder_tasks[line_id].appendleft(product_id)
+                elif role == "finisher" and line_id in self.finisher_tasks:
+                    self.finisher_tasks[line_id].appendleft(product_id)
+
+            # Remove the stuck job
+            del self.agv_jobs[agv_id]
+            logger.info(f"【任务清理】AGV {agv_id} 的任务已重置，产品已返回队列。")
     
     def _send_command(self, line_id: str, command: Dict[str, Any]):
         topic = f"{self.topic_root}/command/{line_id}"
@@ -264,9 +306,18 @@ class TaskScheduler:
 
     def run_forever(self):
         logger.info("任务调度Agent已启动... (按 Ctrl+C 停止)")
-        try: self.client.loop_forever()
-        except KeyboardInterrupt: logger.info("Agent被手动中断，正在关闭...")
-        finally: self.calculate_and_save_kpi(); self.client.disconnect(); logger.info("MQTT已断开连接。")
+        self.client.loop_start()  # Use non-blocking loop
+        try:
+            while True:
+                self.cleanup_stuck_jobs()
+                time.sleep(10)  # Check for stuck jobs every 10 seconds
+        except KeyboardInterrupt:
+            logger.info("Agent被手动中断，正在关闭...")
+        finally:
+            self.calculate_and_save_kpi()
+            self.client.loop_stop()
+            self.client.disconnect()
+            logger.info("MQTT已断开连接。")
 
 if __name__ == "__main__":
     scheduler = TaskScheduler(MQTT_BROKER_HOST, MQTT_BROKER_PORT, TOPIC_ROOT)
