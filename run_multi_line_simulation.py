@@ -11,7 +11,7 @@ sys.path.insert(0, project_root)
 from src.utils.mqtt_client import MQTTClient
 from src.simulation.factory_multi import Factory
 from src.utils.config_loader import load_factory_config
-from config.settings import MQTT_BROKER_HOST, MQTT_BROKER_PORT
+from config.settings import MQTT_BROKER_HOST, MQTT_BROKER_PORT, SIMULATION_SPEED
 import logging
 from config.settings import LOG_LEVEL
 from src.agent_interface.multi_line_command_handler import MultiLineCommandHandler
@@ -100,7 +100,7 @@ class MultiLineFactorySimulation:
                 while self.running:
                     # Run simulation for 1 second at a time
                     self.factory.run(until=int(self.factory.env.now) + 1)
-                    time.sleep(1)  # Small delay to prevent busy waiting
+                    time.sleep(1 / SIMULATION_SPEED)  # Small delay to prevent busy waiting
                     
         except KeyboardInterrupt:
             logger.info("🛑 Simulation interrupted by user")

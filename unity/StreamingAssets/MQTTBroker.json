@@ -28,7 +28,7 @@
   "wss": {
     "port": 8084,
     "host": "supos-ce-instance4.supos.app",
-    "client_id": "NLDF_TEST",
+    "client_id": "marks_mqtt_wss_test",
     "username": "",
     "password": "",
     "keep_alive": 60,
@@ -40,7 +40,7 @@
   },
 
   "common_topic": {
-    "Root_Topic_Head": "NLDF_TEST"
+    "Root_Topic_Head": "marks"
   },
   "connect_mode": { "wss": true }
 }
