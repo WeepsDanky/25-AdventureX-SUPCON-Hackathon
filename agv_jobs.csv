@@ -1,0 +1,5 @@
+agv_id,job_json
+line2_AGV_1,"{""products"": [""prod_1_55cea0c6"", ""prod_1_1e5682fc""], ""from"": ""RawMaterial"", ""to"": ""StationA"", ""step"": ""moving_to_pickup""}"
+line1_AGV_1,"{""products"": [""prod_1_f523af73"", ""prod_1_8e6a4a1d""], ""from"": ""RawMaterial"", ""to"": ""StationA"", ""step"": ""moving_to_pickup""}"
+line3_AGV_1,"{""products"": [""prod_2_28368f68"", ""prod_2_af9acbee""], ""from"": ""RawMaterial"", ""to"": ""StationA"", ""step"": ""moving_to_pickup""}"
+line1_AGV_2,"{""products"": [""prod_1_c94c9372"", ""prod_2_1e24e9fc""], ""from"": ""QualityCheck_output"", ""to"": ""Warehouse"", ""step"": ""moving_to_pickup""}"
