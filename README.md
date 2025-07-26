@@ -34,6 +34,27 @@ uv sync
 uv run run_multi_line_simulation.py (--menu) (--no-mqtt)
 ```
 
+### Adventure X 比赛专用
+
+1. 先点击 Go Live 启动 Unity 仿真界面
+2. 启动任务调度器监听 MQTT broker 的事件发布端口，可选启动基于规则的任务调度器 `task_scheduler.py` 或 Agent 的 `task_scheduler_ai.py`（使用月之暗面的模型 moonshot-v1-8k，需要 MOONSHOT API KEY） 。
+
+```bash
+uv run task_scheduler_ai.py
+```
+
+或
+
+```bash
+uv run task_scheduler.py
+```
+
+3. 启动仿真工厂
+
+```bash
+uv run run_multi_line_simulation.py (--menu) (--no-mqtt)
+```
+
 ### 3. Unity Run
 
 1. 设置 `StreamingAssets/MQTTBroker.json`中的 Root_Topic_Head 字段与上述的 topic root 一致，并修改 wss.client_id 字段防止 client 冲突。
