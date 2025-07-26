@@ -10,10 +10,10 @@ from collections import deque, defaultdict
 from typing import Dict, Any, Optional, List, Tuple
 from openai import OpenAI
 import random
-# [新增] 导入路径时间计算函数和csv模块
+# 导入路径时间计算函数和csv模块
 from config.path_timing import get_travel_time
 import csv
-# [新增] 导入 cycle 用于轮询
+# 导入 cycle 用于轮询
 from itertools import cycle
 
 # --- 全局配置 (Global Configuration) ---
@@ -42,7 +42,7 @@ LOW_BATTERY_THRESHOLD = 35.0
 TARGET_CHARGE_LEVEL = 90.0
 BIDDING_WINDOW_SECONDS = 2.0
 
-# --- [已修复] LLM 辅助模块 (增加了健壮性) ---
+# --- LLM 辅助模块 ---
 class LLMHelper:
     def __init__(self):
         if not MOONSHOT_API_KEY:
@@ -52,7 +52,7 @@ class LLMHelper:
         
         try:
             self.client = OpenAI(api_key=MOONSHOT_API_KEY, base_url="https://api.moonshot.cn/v1")
-            self.client.models.list() # Test connection
+            self.client.models.list()
             logger.info("Kimi LLM 客户端初始化成功。")
         except Exception as e:
             self.client = None
@@ -72,7 +72,7 @@ class LLMHelper:
             logger.error(f"Kimi API 调用失败: {e}")
             return "ERROR_LLM_CALL"
 
-# --- [已修复] 基础 Agent 类 ---
+# --- 基础 Agent 类 ---
 class BaseAgent:
     def __init__(self, agent_id: str, agent_type: str, topic_root: str):
         self.agent_id = agent_id
@@ -168,7 +168,7 @@ class ResourceAgent(BaseAgent):
         logger.info(f"【任务分派】[{self.agent_id}] 向产线 {target_line} 发布新任务: {task_id} (产品: {products})")
         self.publish(publish_topic, task)
 
-# --- 协调 Agent (新增主动寻源逻辑) ---
+# --- 协调 Agent ---
 class CoordinatorAgent(BaseAgent):
     def __init__(self, topic_root: str):
         super().__init__("coordinator", "Coordinator", topic_root)
@@ -180,7 +180,6 @@ class CoordinatorAgent(BaseAgent):
         self.subscribe(f"{self.topic_root}/+/tasks/new", self.handle_new_task)
         self.subscribe(f"{self.topic_root}/tasks/bids", self.handle_new_bid)
         self.subscribe(f"{self.topic_root}/kpi/status", self.handle_kpi_update)
-        # [新增] 订阅 AGV 空闲信号
         self.subscribe(f"{self.topic_root}/agents/available", self.handle_agv_available)
 
     def handle_kpi_update(self, topic: str, payload: dict):
@@ -202,9 +201,7 @@ class CoordinatorAgent(BaseAgent):
                 self.bids[task_id].append(payload)
                 logger.info(f"【投标】[{payload['agv_id']}] 对任务 {task_id} 投标，报价: {payload['bid_score']:.2f}")
     
-    # [新增] 处理 AGV 空闲信号，实现主动寻源
     def handle_agv_available(self, topic: str, payload: dict):
-        """当一个AGV变为空闲时，向它重播当前积压的任务。"""
         agv_id = payload.get("agv_id")
         if not agv_id:
             return
@@ -212,7 +209,6 @@ class CoordinatorAgent(BaseAgent):
         agv_line = agv_id.split('_')[0]
         
         with self.lock:
-            # 找到属于该 AGV 产线的、仍在招标的任务
             tasks_for_agv = [
                 task for task in self.open_tasks.values() 
                 if task['line_id'] == agv_line
@@ -221,7 +217,6 @@ class CoordinatorAgent(BaseAgent):
         if tasks_for_agv:
             logger.info(f"【主动寻源】AGV {agv_id} 空闲，向其重播 {len(tasks_for_agv)} 个积压任务。")
             for task in tasks_for_agv:
-                # 直接向该产线的任务主题发布，以触发 AGV 的 handle_new_task_announcement
                 repost_topic = f"{self.topic_root}/{agv_line}/tasks/new"
                 self.publish(repost_topic, task)
 
@@ -326,13 +321,12 @@ class AGVAgent(BaseAgent):
         self.agv_sim_state = {}
         self.bidding_timeout = 0
 
-        # [修改] AGV 角色分配
         if agv_id_suffix == "AGV_1":
             self.role = "feeder"
-            self.staging_point = LOCATION_MAPPING["RawMaterial"] # Feeder的待命点是原料库
-        else: # AGV_2
+            self.staging_point = LOCATION_MAPPING["RawMaterial"]
+        else:
             self.role = "finisher"
-            self.staging_point = LOCATION_MAPPING["Charging"] # Finisher的待命点是充电站
+            self.staging_point = LOCATION_MAPPING["Charging"]
         logger.info(f"[{self.agent_id}] 初始化完成，角色: {self.role}，待命点: {self.staging_point}")
         
         self.subscribe(f"{self.topic_root}/{line_id}/agv/{agv_id_suffix}/status", self.handle_status_update)
@@ -353,12 +347,10 @@ class AGVAgent(BaseAgent):
             logger.info(f"🔋[{self.agent_id}] 充电完成。")
             self.set_state("idle")
 
-    # [新增] 统一的状态切换和信号发布方法
     def set_state(self, new_state: str):
         if self.state != new_state:
             self.state = new_state
             if new_state == "idle":
-                # 当变为空闲时，发布可用信号，以触发主动寻源
                 self.publish(f"{self.topic_root}/agents/available", {"agv_id": self.agent_id})
 
     def handle_new_task_announcement(self, topic: str, payload: dict):
@@ -378,7 +370,7 @@ class AGVAgent(BaseAgent):
             return
 
         should_bid = False
-        if task_type in ["finisher", "rework"]: # 关键任务不经过LLM
+        if task_type in ["finisher", "rework"]:
             logger.info(f"[{self.agent_id}] 收到关键 '{task_type}' 任务 {payload['task_id']}，将自动投标。")
             should_bid = True
         else:
@@ -405,17 +397,31 @@ class AGVAgent(BaseAgent):
             self.task_step = "start"
             self.execute_task_step()
 
+    # [已修改] 增强 idle 状态下的自主行为循环
     def run(self):
         threading.Thread(target=super().run, daemon=True).start()
         while True:
-            if self.state == "idle":
-                if self.agv_sim_state.get("battery_level", 100) < LOW_BATTERY_THRESHOLD:
-                    logger.info(f"🔋[{self.agent_id}] 电量低，主动进入充电状态。")
-                    self.set_state("charging")
-                    self.send_charge_command()
-            elif self.state == "bidding" and time.time() > self.bidding_timeout:
-                logger.warning(f"[{self.agent_id}] 投标超时，返回 IDLE 状态。")
-                self.set_state("idle")
+            # 仅在获取到仿真器状态后才执行逻辑
+            if self.agv_sim_state:
+                if self.state == "idle":
+                    # 1. 最高优先级：检查电量
+                    if self.agv_sim_state.get("battery_level", 100) < LOW_BATTERY_THRESHOLD:
+                        logger.info(f"🔋[{self.agent_id}] 电量低，主动进入充电状态。")
+                        self.set_state("charging")
+                        self.send_charge_command()
+                    # 2. 第二优先级：检查是否在待命点
+                    elif self.agv_sim_state.get("current_point") != self.staging_point:
+                        logger.info(f"[{self.agent_id}] 空闲中，自动返回待命点 {self.staging_point}")
+                        self.set_state("working") # 使用 "working" 状态来表示正在执行内部移动任务
+                        line_id, agv_id_suffix = self.agent_id.split('_', 1)
+                        self.send_move_command(line_id, agv_id_suffix, self.staging_point)
+                    # 3. 如果一切就绪，则保持空闲并定期广播自己的可用性
+                    else:
+                        self.set_state("idle")
+                
+                elif self.state == "bidding" and time.time() > self.bidding_timeout:
+                    logger.warning(f"[{self.agent_id}] 投标超时，返回 IDLE 状态。")
+                    self.set_state("idle")
             
             time.sleep(1)
             self.publish_status()
@@ -426,6 +432,7 @@ class AGVAgent(BaseAgent):
             "status": self.state, "data": self.agv_sim_state
         })
 
+    # [已修改] 修复路径计算 Bug
     def calculate_bid_score(self, task: dict) -> float:
         current_point = self.agv_sim_state.get("current_point")
         battery_level = self.agv_sim_state.get("battery_level", 0)
@@ -441,11 +448,12 @@ class AGVAgent(BaseAgent):
             logger.error(f"[{self.agent_id}] 任务 {task['task_id']} 包含无效的位置信息。")
             return float('inf')
 
-        time_to_pickup = get_travel_time(current_point, pickup_point)
+        # [修复] 如果 AGV 已在取货点，行驶时间为0
+        time_to_pickup = 0.0 if current_point == pickup_point else get_travel_time(current_point, pickup_point)
         time_to_dropoff = get_travel_time(pickup_point, dropoff_point)
         
         if time_to_pickup < 0 or time_to_dropoff < 0:
-            logger.warning(f"[{self.agent_id}] 无法计算任务 {task['task_id']} 的路径。({current_point}->{pickup_point}->{dropoff_point})")
+            logger.warning(f"[{self.agent_id}] 无法计算任务 {task['task_id']} 的路径。(从 {current_point} 到 {pickup_point} 再到 {dropoff_point})")
             return float('inf')
             
         total_task_time = time_to_pickup + time_to_dropoff
@@ -493,7 +501,6 @@ class AGVAgent(BaseAgent):
         
         return self.llm.ask_kimi(prompt, system_prompt)
 
-    # [修改] 增加任务完成后的自动返回逻辑
     def execute_task_step(self):
         if not self.current_task: return
 
@@ -531,12 +538,8 @@ class AGVAgent(BaseAgent):
             self.task_step = None
             self.set_state("idle")
             
-            # [新增] 任务完成后，自动返回待命点
-            if self.agv_sim_state.get("current_point") != self.staging_point:
-                logger.info(f"[{self.agent_id}] 任务完成，自动返回待命点 {self.staging_point}")
-                self.send_move_command(line_id, agv_id_suffix, self.staging_point)
-
-
+            # 任务完成后，后续决策由主 run 循环处理（返回待命点）
+            
     def send_move_command(self, line_id: str, agv_id: str, target_point: str):
         self._send_command(line_id, {"action": "move", "target": agv_id, "params": {"target_point": target_point}})
     def send_load_command(self, line_id: str, agv_id: str, product_id: Optional[str]):
