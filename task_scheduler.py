@@ -411,9 +411,10 @@ class EnhancedTaskScheduler:
         total_score = efficiency_score + quality_cost_score + agv_score
         
         filename = f"kpi_results_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+        filepath = "kpi_results"
         report_data = {"总得分": f"{total_score:.2f}", "生产效率得分 (40%)": f"{efficiency_score:.2f}", **{f"  - {k}": f"{v:.2f}" for k, v in {"订单完成率 (%)": kpis.get('order_completion_rate', 0), "生产周期效率得分": production_cycle_score, "设备利用率 (%)": kpis.get('device_utilization', 0)}.items()}, "质量与成本得分 (30%)": f"{quality_cost_score:.2f}", **{f"  - {k}": f"{v:.2f}" for k, v in {"一次通过率 (%)": kpis.get('first_pass_rate', 0), "成本效率得分 (估算)": cost_efficiency_score}.items()}, "AGV效率得分 (30%)": f"{agv_score:.2f}", **{f"  - {k}": f"{v:.2f}" for k, v in {"充电策略效率 (%)": kpis.get('charge_strategy_efficiency', 0), "能效比得分": agv_energy_efficiency_score, "AGV利用率 (%)": kpis.get('agv_utilization', 0)}.items()}, "--- 原始数据 ---": "---", **{k: v for k, v in {"总订单数": kpis.get('total_orders', 0), "已完成订单数": kpis.get('completed_orders', 0)}.items()}, **{k: f"${v:.2f}" for k, v in {"总生产成本": kpis.get('total_production_cost', 0), "物料成本": kpis.get('material_costs', 0), "能源成本": kpis.get('energy_costs', 0), "维修成本": kpis.get('maintenance_costs', 0), "报废成本": kpis.get('scrap_costs', 0)}.items()}}
         try:
-            with open(filename, 'w', newline='', encoding='utf-8-sig') as f:
+            with open(os.path.join(filepath,filename), 'w', newline='', encoding='utf-8-sig') as f:
                 writer = csv.writer(f); writer.writerow(['KPI 指标', '值']); writer.writerows(report_data.items())
             logger.info(f"KPI报告已成功保存到文件: {filename}")
         except IOError as e: logger.error(f"无法写入KPI报告文件 {filename}: {e}")
