@@ -123,14 +123,13 @@ class BaseAgent:
         self.connect()
         self.client.loop_forever()
 
-# --- 资源 Agent (修改了任务分派逻辑) ---
+# --- 资源 Agent ---
 class ResourceAgent(BaseAgent):
     def __init__(self, agent_id: str, line_id: str, device_name: str, topic_root: str):
         super().__init__(agent_id, "Resource", topic_root)
         self.line_id = line_id
         self.device_name = device_name
         self.published_tasks = set()
-        # [修改] 为 RawMaterial Agent 添加产线轮询器
         if self.device_name == "RawMaterial":
             self.line_cycler = cycle(FACTORY_LINES)
         
@@ -146,7 +145,6 @@ class ResourceAgent(BaseAgent):
         if self.device_name == "RawMaterial":
             products = [p for p in payload.get("buffer", []) if p not in self.published_tasks]
             if products:
-                # [修改] 使用轮询策略为每个产品分配产线
                 target_line = next(self.line_cycler)
                 self._create_and_publish_task("feeder", products, "RawMaterial", "StationA", target_line)
         elif self.device_name == "QualityCheck":
@@ -158,21 +156,19 @@ class ResourceAgent(BaseAgent):
         
         for prod_id in products: self.published_tasks.add(prod_id)
 
-    # [修改] 增加 target_line 参数，并修改发布主题
     def _create_and_publish_task(self, task_type: str, products: List[str], from_loc: str, to_loc: str, target_line: str):
         task_id = f"task_{self.device_name.lower()}_{uuid.uuid4().hex[:8]}"
         task = {
-            "task_id": task_id, "source_agent": self.agent_id, "line_id": target_line, # [修改] line_id 现在是具体产线
+            "task_id": task_id, "source_agent": self.agent_id, "line_id": target_line,
             "task_type": task_type, "products": products, "from_loc": from_loc,
             "to_loc": to_loc, "priority": "high" if task_type == "finisher" else "normal",
             "creation_time": time.time()
         }
-        # [修改] 发布到特定产线的主题
         publish_topic = f"{self.topic_root}/{target_line}/tasks/new"
         logger.info(f"【任务分派】[{self.agent_id}] 向产线 {target_line} 发布新任务: {task_id} (产品: {products})")
         self.publish(publish_topic, task)
 
-# --- 协调 Agent (现在订阅特定产线的任务) ---
+# --- 协调 Agent (新增主动寻源逻辑) ---
 class CoordinatorAgent(BaseAgent):
     def __init__(self, topic_root: str):
         super().__init__("coordinator", "Coordinator", topic_root)
@@ -181,10 +177,11 @@ class CoordinatorAgent(BaseAgent):
         self.lock = threading.Lock()
         self.latest_kpi_data: Optional[Dict[str, Any]] = None
         
-        # [修改] 订阅所有产线的新任务主题
         self.subscribe(f"{self.topic_root}/+/tasks/new", self.handle_new_task)
         self.subscribe(f"{self.topic_root}/tasks/bids", self.handle_new_bid)
         self.subscribe(f"{self.topic_root}/kpi/status", self.handle_kpi_update)
+        # [新增] 订阅 AGV 空闲信号
+        self.subscribe(f"{self.topic_root}/agents/available", self.handle_agv_available)
 
     def handle_kpi_update(self, topic: str, payload: dict):
         self.latest_kpi_data = payload
@@ -204,6 +201,29 @@ class CoordinatorAgent(BaseAgent):
             if task_id in self.open_tasks:
                 self.bids[task_id].append(payload)
                 logger.info(f"【投标】[{payload['agv_id']}] 对任务 {task_id} 投标，报价: {payload['bid_score']:.2f}")
+    
+    # [新增] 处理 AGV 空闲信号，实现主动寻源
+    def handle_agv_available(self, topic: str, payload: dict):
+        """当一个AGV变为空闲时，向它重播当前积压的任务。"""
+        agv_id = payload.get("agv_id")
+        if not agv_id:
+            return
+        
+        agv_line = agv_id.split('_')[0]
+        
+        with self.lock:
+            # 找到属于该 AGV 产线的、仍在招标的任务
+            tasks_for_agv = [
+                task for task in self.open_tasks.values() 
+                if task['line_id'] == agv_line
+            ]
+        
+        if tasks_for_agv:
+            logger.info(f"【主动寻源】AGV {agv_id} 空闲，向其重播 {len(tasks_for_agv)} 个积压任务。")
+            for task in tasks_for_agv:
+                # 直接向该产线的任务主题发布，以触发 AGV 的 handle_new_task_announcement
+                repost_topic = f"{self.topic_root}/{agv_line}/tasks/new"
+                self.publish(repost_topic, task)
 
     def auction_tasks(self):
         while True:
@@ -212,13 +232,17 @@ class CoordinatorAgent(BaseAgent):
                 tasks_to_assign = [task_id for task_id, task in self.open_tasks.items() if time.time() > task["bidding_deadline"]]
 
                 for task_id in tasks_to_assign:
+                    task_info = self.open_tasks.get(task_id)
+                    if task_info is None:
+                        continue
+                        
                     if task_id in self.bids and self.bids[task_id]:
                         best_bid = min(self.bids[task_id], key=lambda x: x['bid_score'])
-                        assignment = {"task_id": task_id, "assigned_agv_id": best_bid['agv_id'], **self.open_tasks[task_id]}
+                        assignment = {"task_id": task_id, "assigned_agv_id": best_bid['agv_id'], **task_info}
                         self.publish(f"{self.topic_root}/tasks/assignments", assignment)
                         logger.info(f"【任务分配】任务 {task_id} 分配给 AGV {best_bid['agv_id']} (最优报价: {best_bid['bid_score']:.2f})")
                     else:
-                        self.open_tasks[task_id]["bidding_deadline"] = time.time() + BIDDING_WINDOW_SECONDS
+                        task_info["bidding_deadline"] = time.time() + BIDDING_WINDOW_SECONDS
                         logger.info(f"【任务看板】任务 {task_id} 无人投标，重新招标。")
                     
                     if task_id in self.open_tasks: del self.open_tasks[task_id]
@@ -294,55 +318,89 @@ class AGVAgent(BaseAgent):
     def __init__(self, line_id: str, agv_id_suffix: str, topic_root: str, llm: LLMHelper):
         agent_id = f"{line_id}_{agv_id_suffix}"
         super().__init__(agent_id, "AGV", topic_root)
-        self.line_id = line_id # [新增] 保存自身产线ID
+        self.line_id = line_id
         self.llm = llm
         self.state = "initializing"
         self.task_step = None
         self.current_task = None
         self.agv_sim_state = {}
         self.bidding_timeout = 0
+
+        # [修改] AGV 角色分配
+        if agv_id_suffix == "AGV_1":
+            self.role = "feeder"
+            self.staging_point = LOCATION_MAPPING["RawMaterial"] # Feeder的待命点是原料库
+        else: # AGV_2
+            self.role = "finisher"
+            self.staging_point = LOCATION_MAPPING["Charging"] # Finisher的待命点是充电站
+        logger.info(f"[{self.agent_id}] 初始化完成，角色: {self.role}，待命点: {self.staging_point}")
         
         self.subscribe(f"{self.topic_root}/{line_id}/agv/{agv_id_suffix}/status", self.handle_status_update)
         self.subscribe(f"{self.topic_root}/tasks/assignments", self.handle_assignment)
-        # [修改] AGV只订阅自己产线的任务
         self.subscribe(f"{self.topic_root}/{self.line_id}/tasks/new", self.handle_new_task_announcement)
 
     def handle_status_update(self, topic: str, payload: dict):
         self.agv_sim_state = payload
         
         if self.state == "initializing" and payload.get("status") == "idle":
-            self.state = "idle"
-            logger.info(f"[{self.agent_id}] 初始化完成，进入 IDLE 状态。")
+            self.set_state("idle")
+            logger.info(f"[{self.agent_id}] 进入 IDLE 状态。")
         
         if self.state == "working" and payload.get("status") == "idle":
             self.execute_task_step()
         
         if self.state == "charging" and payload.get("battery_level", 0) >= TARGET_CHARGE_LEVEL:
             logger.info(f"🔋[{self.agent_id}] 充电完成。")
-            self.state = "idle"
+            self.set_state("idle")
+
+    # [新增] 统一的状态切换和信号发布方法
+    def set_state(self, new_state: str):
+        if self.state != new_state:
+            self.state = new_state
+            if new_state == "idle":
+                # 当变为空闲时，发布可用信号，以触发主动寻源
+                self.publish(f"{self.topic_root}/agents/available", {"agv_id": self.agent_id})
 
     def handle_new_task_announcement(self, topic: str, payload: dict):
-        if self.state == "idle":
+        if self.state != "idle":
+            return
+        
+        task_type = payload.get("task_type")
+        
+        is_my_task = False
+        if self.role == "feeder" and task_type == "feeder":
+            is_my_task = True
+        elif self.role == "finisher" and task_type in ["finisher", "rework"]:
+            is_my_task = True
+            
+        if not is_my_task:
+            logger.debug(f"[{self.agent_id}] 忽略任务 {payload['task_id']} (类型: {task_type}), 与角色 {self.role} 不匹配。")
+            return
+
+        should_bid = False
+        if task_type in ["finisher", "rework"]: # 关键任务不经过LLM
+            logger.info(f"[{self.agent_id}] 收到关键 '{task_type}' 任务 {payload['task_id']}，将自动投标。")
+            should_bid = True
+        else:
             decision = self.llm_decide_to_bid(payload)
             should_bid = "YES" in decision or "ERROR_LLM" in decision
 
-            if should_bid:
-                bid_score = self.calculate_bid_score(payload)
-                if bid_score != float('inf'):
-                    self.state = "bidding"
-                    self.bidding_timeout = time.time() + 5
-                    self.publish(f"{self.topic_root}/tasks/bids", {"task_id": payload['task_id'], "agv_id": self.agent_id, "bid_score": bid_score})
-                    logger.info(f"[{self.agent_id}] 对任务 {payload['task_id']} 投标，进入 BIDDING 状态。")
-            else:
-                logger.info(f"[{self.agent_id}] LLM 决策不对任务 {payload['task_id']} 投标: {decision}")
+        if should_bid:
+            bid_score = self.calculate_bid_score(payload)
+            if bid_score != float('inf'):
+                self.set_state("bidding")
+                self.bidding_timeout = time.time() + 5
+                self.publish(f"{self.topic_root}/tasks/bids", {"task_id": payload['task_id'], "agv_id": self.agent_id, "bid_score": bid_score})
+                logger.info(f"[{self.agent_id}] 对任务 {payload['task_id']} 投标，进入 BIDDING 状态。")
+        elif task_type not in ["finisher", "rework"]:
+            logger.info(f"[{self.agent_id}] LLM 决策不对任务 {payload['task_id']} 投标: {decision}")
 
     def handle_assignment(self, topic: str, payload: dict):
-        # 增加产线匹配检查，确保不会意外收到其他产线的分配
         if payload.get("line_id") != self.line_id:
             return
         if self.state == "bidding" and payload["assigned_agv_id"] == self.agent_id:
             logger.info(f"🎉 [{self.agent_id}] 赢得任务 {payload['task_id']}！")
-            self.state = "working"
+            self.set_state("working")
             self.current_task = payload
             self.task_step = "start"
             self.execute_task_step()
@@ -353,11 +411,11 @@ class AGVAgent(BaseAgent):
             if self.state == "idle":
                 if self.agv_sim_state.get("battery_level", 100) < LOW_BATTERY_THRESHOLD:
                     logger.info(f"🔋[{self.agent_id}] 电量低，主动进入充电状态。")
-                    self.state = "charging"
+                    self.set_state("charging")
                     self.send_charge_command()
             elif self.state == "bidding" and time.time() > self.bidding_timeout:
                 logger.warning(f"[{self.agent_id}] 投标超时，返回 IDLE 状态。")
-                self.state = "idle"
+                self.set_state("idle")
             
             time.sleep(1)
             self.publish_status()
@@ -413,10 +471,9 @@ class AGVAgent(BaseAgent):
         return final_score
 
     def llm_decide_to_bid(self, task: dict) -> str:
-        # [修改] 简化System Prompt，因为任务已经是定向的
         system_prompt = (
-            "You are a decision-making AI for an AGV. Your goal is to be efficient. "
-            "You have been assigned a task on your production line. Decide if you should accept it. "
+            "You are a decision-making AI for an AGV with a specific role. Your goal is to be efficient. "
+            "You have been assigned a task that matches your role. Decide if you should accept it based on your current state. "
             "Key factors: proximity (how close you are) and capability (battery, status). "
             "Respond ONLY with 'YES' or 'NO' and a brief, concise reason."
         )
@@ -424,10 +481,11 @@ class AGVAgent(BaseAgent):
         prompt = (
             f"--- My Current State ---\n"
             f"Agent ID: {self.agent_id}\n"
+            f"My Role: {self.role}\n"
             f"Status: {self.state}\n"
             f"Current Location: {self.agv_sim_state.get('current_point', 'Unknown')}\n"
             f"Battery Level: {self.agv_sim_state.get('battery_level', 0):.1f}%\n\n"
-            f"--- New Task Details (for my line) ---\n"
+            f"--- New Task Details (matches my role) ---\n"
             f"{json.dumps(task, indent=2)}\n\n"
             f"--- Decision ---\n"
             f"Should I bid on this task?"
@@ -435,6 +493,7 @@ class AGVAgent(BaseAgent):
         
         return self.llm.ask_kimi(prompt, system_prompt)
 
+    # [修改] 增加任务完成后的自动返回逻辑
     def execute_task_step(self):
         if not self.current_task: return
 
@@ -450,27 +509,33 @@ class AGVAgent(BaseAgent):
             logger.info(f"  [步骤 1] AGV {self.agent_id}: 前往取货点 {pickup_point} ({task['from_loc']})")
             self.send_move_command(line_id, agv_id_suffix, pickup_point)
 
-        elif self.task_step == "moving_to_pickup" and agv_sim_state["current_point"] == pickup_point:
+        elif self.task_step == "moving_to_pickup" and agv_sim_state.get("current_point") == pickup_point:
             self.task_step = "loading"
             logger.info(f"  [步骤 2] AGV {self.agent_id}: 到达取货点，开始装载")
             self.send_load_command(line_id, agv_id_suffix, task['products'][0] if task['from_loc'] == "RawMaterial" else None)
 
-        elif self.task_step == "loading" and len(agv_sim_state["payload"]) > 0:
+        elif self.task_step == "loading" and len(agv_sim_state.get("payload", [])) > 0:
             self.task_step = "moving_to_dropoff"
             logger.info(f"  [步骤 3] AGV {self.agent_id}: 装载完成，前往卸货点 {dropoff_point} ({task['to_loc']})")
             self.send_move_command(line_id, agv_id_suffix, dropoff_point)
 
-        elif self.task_step == "moving_to_dropoff" and agv_sim_state["current_point"] == dropoff_point:
+        elif self.task_step == "moving_to_dropoff" and agv_sim_state.get("current_point") == dropoff_point:
             self.task_step = "unloading"
             logger.info(f"  [步骤 4] AGV {self.agent_id}: 到达卸货点，开始卸载")
             self.send_unload_command(line_id, agv_id_suffix)
 
-        elif self.task_step == "unloading" and len(agv_sim_state["payload"]) == 0:
+        elif self.task_step == "unloading" and len(agv_sim_state.get("payload", [])) == 0:
             logger.info(f"【任务完成】AGV {self.agent_id} 完成了任务 {task['task_id']}。")
             self.publish(f"{self.topic_root}/tasks/updates", {"task_id": task['task_id'], "agv_id": self.agent_id, "status": "completed"})
-            self.state = "idle"
             self.current_task = None
             self.task_step = None
+            self.set_state("idle")
+            
+            # [新增] 任务完成后，自动返回待命点
+            if self.agv_sim_state.get("current_point") != self.staging_point:
+                logger.info(f"[{self.agent_id}] 任务完成，自动返回待命点 {self.staging_point}")
+                self.send_move_command(line_id, agv_id_suffix, self.staging_point)
+
 
     def send_move_command(self, line_id: str, agv_id: str, target_point: str):
         self._send_command(line_id, {"action": "move", "target": agv_id, "params": {"target_point": target_point}})
@@ -496,7 +561,6 @@ if __name__ == "__main__":
     coordinator = CoordinatorAgent(TOPIC_ROOT)
     agents.append(coordinator)
     
-    # [修改] RawMaterial Agent 的 line_id 设置为 'global' 仅用于标识，实际任务会分派
     resource_agents_config = [{"agent_id": "global_RawMaterial", "line_id": "global", "device_name": "RawMaterial"}]
     for line in FACTORY_LINES:
         resource_agents_config.append({"agent_id": f"{line}_QualityCheck", "line_id": line, "device_name": "QualityCheck"})
