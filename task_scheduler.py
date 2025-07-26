@@ -15,46 +15,56 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
-logger = logging.getLogger("TaskSchedulerAgent")
+logger = logging.getLogger("TaskSchedulerAgentV2")
 
 MQTT_BROKER_HOST = os.getenv("MQTT_BROKER_HOST", "supos-ce-instance4.supos.app")
 MQTT_BROKER_PORT = int(os.getenv("MQTT_BROKER_PORT", 1883))
 TOPIC_ROOT = os.getenv("TOPIC_ROOT") or os.getenv("USERNAME") or os.getenv("USER") or "marks"
 
 # --- Constants ---
+# [MODIFIED] Updated location mapping for P3 rework
 LOCATION_MAPPING = {
     "RawMaterial": "P0",
     "StationA": "P1",
+    "StationB": "P3",
+    "Conveyor_CQ_upper": "P6",
+    "Conveyor_CQ_lower": "P6",
     "QualityCheck_output": "P8",
-    "Warehouse": "P9"
+    "Warehouse": "P9",
+    "Charging": "P10"
 }
 FACTORY_LINES = ["line1", "line2", "line3"]
 AGV_CAPACITY = 2
-AGV_ROLES = {
-    "AGV_1": "feeder",       # RawMaterial -> StationA
-    "AGV_2": "finisher"      # QualityCheck -> Warehouse
-}
 JOB_TIMEOUT_SECONDS = 120  # 2 minutes
 
-class TaskScheduler:
+# [NEW] Proactive charging thresholds
+LOW_BATTERY_THRESHOLD = 40.0
+TARGET_CHARGE_LEVEL = 90.0
+
+class EnhancedTaskScheduler:
     """
-    An intelligent agent that schedules factory AGV tasks based on predefined roles
-    and optimizes for multi-product transport.
+    An intelligent agent that schedules factory AGV tasks with dynamic roles,
+    proactive charging, and awareness of the factory's real-time state.
     """
     def __init__(self, broker_host: str, broker_port: int, topic_root: str):
         self.topic_root = topic_root
-        self.client_id = f"{topic_root}_task_scheduler_agent_{int(time.time())}"
-        
+        self.client_id = f"{topic_root}_enhanced_scheduler_agent_{int(time.time())}"
+
         # --- State Management ---
-        self.feeder_tasks: Dict[str, deque] = {line: deque() for line in FACTORY_LINES}
-        self.finisher_tasks: Dict[str, deque] = {line: deque() for line in FACTORY_LINES}
+        # [MODIFIED] Unified task queues per line
+        self.task_queues: Dict[str, Dict[str, deque]] = {
+            line: {"feeder": deque(), "finisher": deque(), "rework": deque()}
+            for line in FACTORY_LINES
+        }
         
+        # [NEW] State models for devices
         self.agv_states: Dict[str, Dict[str, Any]] = {}
+        self.device_states: Dict[str, Dict[str, Any]] = {} # For stations and conveyors
+
         self.agv_jobs: Dict[str, Dict[str, Any]] = {}
         self.tasks_created_for_product: set[str] = set()
-        
         self.line_cycler = cycle(FACTORY_LINES)
-        
+
         # --- KPI Data Storage ---
         self.latest_kpi_data: Optional[Dict[str, Any]] = None
 
@@ -62,7 +72,7 @@ class TaskScheduler:
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, self.client_id)
         self.client.on_connect = self.on_connect
         self.client.on_message = self.on_message
-        
+
         logger.info(f"Connecting to MQTT Broker {broker_host}:{broker_port}")
         self.client.connect(broker_host, broker_port, 60)
 
@@ -74,11 +84,13 @@ class TaskScheduler:
             logger.error(f"Failed to connect, return code: {rc}")
 
     def _subscribe_to_topics(self):
-        """Subscribe to all necessary topics."""
+        """[MODIFIED] Subscribe to all necessary topics for enhanced awareness."""
         topics = [
             (f"{self.topic_root}/warehouse/RawMaterial/status", 1),
-            (f"{self.topic_root}/+/station/QualityCheck/status", 1),
+            (f"{self.topic_root}/+/station/+/status", 1),
+            (f"{self.topic_root}/+/conveyor/+/status", 1),
             (f"{self.topic_root}/+/agv/+/status", 1),
+            (f"{self.topic_root}/+/alerts", 1),
             (f"{self.topic_root}/response/+", 1),
             (f"{self.topic_root}/kpi/status", 1)
         ]
@@ -87,120 +99,221 @@ class TaskScheduler:
             self.client.subscribe(topic, qos)
 
     def on_message(self, client, userdata, msg):
-        """Main message handler, routes messages to specific handlers."""
+        """[MODIFIED] Main message handler, routes messages to specific handlers."""
         try:
-            topic = msg.topic
+            topic_parts = msg.topic.split('/')
             payload = json.loads(msg.payload.decode('utf-8'))
             
-            if "kpi/status" in topic: self.handle_kpi_status(payload)
-            elif "RawMaterial/status" in topic: self.handle_raw_material_status(payload)
-            elif "QualityCheck/status" in topic: self.handle_quality_check_status(topic.split('/')[1], payload)
-            elif "agv" in topic and "status" in topic: self.handle_agv_status(topic.split('/')[1], topic.split('/')[3], payload)
-            elif "response" in topic: logger.debug(f"Command response received: {payload.get('response')}")
+            # Route based on topic structure
+            if "kpi/status" in msg.topic: self.handle_kpi_status(payload)
+            elif "warehouse/RawMaterial/status" in msg.topic: self.handle_raw_material_status(payload)
+            elif "station" in msg.topic: self.handle_station_status(topic_parts[1], topic_parts[3], payload)
+            elif "conveyor" in msg.topic: self.handle_conveyor_status(topic_parts[1], topic_parts[3], payload)
+            elif "agv" in msg.topic: self.handle_agv_status(topic_parts[1], topic_parts[3], payload)
+            elif "alerts" in msg.topic: self.handle_alert(topic_parts[1], payload)
+            elif "response" in msg.topic: logger.debug(f"Command response received: {payload.get('response')}")
         except Exception as e:
             logger.error(f"Error processing message from topic '{msg.topic}': {e}", exc_info=True)
 
-    def handle_kpi_status(self, payload: Dict[str, Any]):
-        self.latest_kpi_data = payload
+    # --- [NEW] Handlers for enhanced awareness ---
+    def handle_station_status(self, line_id: str, device_id: str, payload: Dict[str, Any]):
+        full_device_id = f"{line_id}_{device_id}"
+        self.device_states[full_device_id] = {
+            "status": payload.get("status"),
+            "buffer": payload.get("buffer", []),
+            "output_buffer": payload.get("output_buffer", [])
+        }
+        # Specifically handle QualityCheck for finisher tasks
+        if device_id == "QualityCheck":
+            for product_id in payload.get("output_buffer", []):
+                self.add_task(product_id, "QualityCheck_output", "Warehouse", line_id)
 
+    def handle_conveyor_status(self, line_id: str, device_id: str, payload: Dict[str, Any]):
+        full_device_id = f"{line_id}_{device_id}"
+        self.device_states[full_device_id] = {"status": payload.get("status")}
+        # Specifically handle Conveyor_CQ for P3 rework tasks
+        if device_id == "Conveyor_CQ":
+            for product_id in payload.get("upper_buffer", []):
+                self.add_task(product_id, "Conveyor_CQ_upper", "StationB", line_id)
+            for product_id in payload.get("lower_buffer", []):
+                self.add_task(product_id, "Conveyor_CQ_lower", "StationB", line_id)
+
+    def handle_alert(self, line_id: str, payload: Dict[str, Any]):
+        device_id = payload.get("device_id")
+        full_device_id = f"{line_id}_{device_id}"
+        if payload.get("alert_type") == "fault_injected":
+            logger.warning(f"🚨【故障告警】产线 {line_id} 设备 {device_id}: {payload.get('symptom')}")
+            self.device_states[full_device_id] = {"status": "fault"}
+        elif payload.get("alert_type") == "fault_recovered":
+            logger.info(f"✅【故障恢复】产线 {line_id} 设备 {device_id}")
+            if full_device_id in self.device_states:
+                self.device_states[full_device_id]["status"] = "idle" # Assume idle after recovery
+
+    def handle_kpi_status(self, payload: Dict[str, Any]):
+        """[NEW] Handle KPI status updates from the factory."""
+        self.latest_kpi_data = payload
+        logger.debug(f"KPI状态更新: {payload.get('total_products', 0)} 个产品，完成率: {payload.get('order_completion_rate', 0):.1f}%")
+
+    # --- [MODIFIED] Core Logic with Smarter Rules ---
+    
     def handle_raw_material_status(self, payload: Dict[str, Any]):
-        """Creates feeder tasks for new products in the RawMaterial warehouse."""
         for product_id in payload.get("buffer", []):
             self.add_task(product_id, "RawMaterial", "StationA")
 
-    def handle_quality_check_status(self, line_id: str, payload: Dict[str, Any]):
-        """Creates finisher tasks for products in the QualityCheck output buffer."""
-        for product_id in payload.get("output_buffer", []):
-            self.add_task(product_id, "QualityCheck_output", "Warehouse", line_id)
-
     def handle_agv_status(self, line_id: str, agv_id: str, payload: Dict[str, Any]):
-        """Updates AGV state and triggers scheduling or next job step."""
         full_agv_id = f"{line_id}_{agv_id}"
         new_status = payload.get("status")
         
-        # Update the state regardless of changes
         self.agv_states[full_agv_id] = {
             "status": new_status,
+            "battery_level": payload.get("battery_level", 100.0),
             "current_point": payload.get("current_point"),
             "payload": payload.get("payload", []),
-            "line_id": line_id,
-            "agv_id": agv_id,
-            "role": AGV_ROLES.get(agv_id)
+            "line_id": line_id, "agv_id": agv_id,
         }
         
-        # If the AGV is idle, it's ready for its next instruction or a new job.
         if new_status == "idle":
-            logger.info(f"AGV {full_agv_id} is now idle at {payload.get('current_point')}. Checking for work.")
+            logger.info(f"AGV {full_agv_id} is now idle at {payload.get('current_point')}. Battery: {payload.get('battery_level'):.1f}%.")
             if full_agv_id in self.agv_jobs:
                 self.execute_next_step(full_agv_id)
             else:
-                self.schedule_tasks()
+                # [MODIFIED] Proactive charging check before scheduling
+                if not self.check_and_start_proactive_charging(full_agv_id):
+                    self.schedule_tasks()
 
     def add_task(self, product_id: str, from_loc: str, to_loc: str, line_id: Optional[str] = None):
-        """Adds a new task to the appropriate role-based queue."""
         if product_id in self.tasks_created_for_product: return
+
+        product_type_char = product_id.split('_')[1]
         
         if from_loc == "RawMaterial":
-            # Assign feeder tasks to lines in a round-robin fashion
             target_line = next(self.line_cycler)
-            self.feeder_tasks[target_line].append(product_id)
+            self.task_queues[target_line]["feeder"].append(product_id)
             logger.info(f"【新 Feeder 任务】产线 {target_line}: 从 {from_loc} 到 {to_loc}，产品: {product_id}")
-        elif from_loc == "QualityCheck_output" and line_id:
-            self.finisher_tasks[line_id].append(product_id)
+        elif from_loc == "QualityCheck_output":
+            self.task_queues[line_id]["finisher"].append(product_id)
             logger.info(f"【新 Finisher 任务】产线 {line_id}: 从 {from_loc} 到 {to_loc}，产品: {product_id}")
+        elif from_loc.startswith("Conveyor_CQ"):
+            self.task_queues[line_id]["rework"].append({"product_id": product_id, "from": from_loc, "to": to_loc})
+            logger.info(f"【新 P3 返工任务】产线 {line_id}: 从 {from_loc} 到 {to_loc}，产品: {product_id}")
 
         self.tasks_created_for_product.add(product_id)
         self.schedule_tasks()
 
+    def check_and_start_proactive_charging(self, agv_id: str) -> bool:
+        """[NEW] Implements proactive charging strategy."""
+        state = self.agv_states.get(agv_id)
+        if state and state["battery_level"] < LOW_BATTERY_THRESHOLD:
+            logger.info(f"🔋【主动充电】AGV {agv_id} 电量低 ({state['battery_level']:.1f}%)，前往充电。")
+            self.send_charge_command(state["line_id"], state["agv_id"], TARGET_CHARGE_LEVEL)
+            return True
+        return False
+
     def schedule_tasks(self):
-        """Iterates through idle AGVs and assigns them tasks based on their role."""
-        idle_agvs = [agv_id for agv_id, state in self.agv_states.items() if state['status'] == 'idle' and agv_id not in self.agv_jobs]
+        """[REWRITTEN] Assigns tasks to any available AGV with pre-dispatch checks."""
+        idle_agvs = [agv_id for agv_id, state in self.agv_states.items() 
+                     if state['status'] == 'idle' and agv_id not in self.agv_jobs]
+        
+        if not idle_agvs: return
+
+        # Task priority: Finisher > Rework > Feeder
+        task_priority = ["finisher", "rework", "feeder"]
         
         for agv_id in idle_agvs:
-            state = self.agv_states[agv_id]
-            role = state.get("role")
-            line_id = state.get("line_id")
-            
-            task_products = []
-            if role == "feeder" and self.feeder_tasks[line_id]:
-                while len(task_products) < AGV_CAPACITY and self.feeder_tasks[line_id]:
-                    task_products.append(self.feeder_tasks[line_id].popleft())
-                from_loc, to_loc = "RawMaterial", "StationA"
-                
-            elif role == "finisher" and self.finisher_tasks[line_id]:
-                while len(task_products) < AGV_CAPACITY and self.finisher_tasks[line_id]:
-                    task_products.append(self.finisher_tasks[line_id].popleft())
-                from_loc, to_loc = "QualityCheck_output", "Warehouse"
+            agv_state = self.agv_states[agv_id]
+            # Skip AGVs that are low on battery
+            if agv_state["battery_level"] < LOW_BATTERY_THRESHOLD:
+                continue
 
-            if task_products:
-                self.agv_jobs[agv_id] = {
-                    "products": task_products,
-                    "from": from_loc, "to": to_loc,
-                    "step": "start",
-                    "last_updated": time.time()  # Add timestamp tracking
-                }
-                logger.info(f"【任务分配】AGV {agv_id} ({role}) 分配到任务: 运送 {len(task_products)} 个产品 ({', '.join(task_products)}) 从 {from_loc} 到 {to_loc}")
-                self.execute_next_step(agv_id)
+            assigned = False
+            for task_type in task_priority:
+                for line_id in FACTORY_LINES:
+                    if self.task_queues[line_id][task_type]:
+                        # Pre-dispatch checks
+                        from_loc, to_loc = self.get_task_locations(task_type, line_id)
+                        if not self.is_destination_ok(line_id, to_loc):
+                            logger.warning(f"【调度暂缓】目标 {to_loc} (产线 {line_id}) 不可用，跳过任务。")
+                            continue
+
+                        task_products = []
+                        if task_type == "rework":
+                            rework_job = self.task_queues[line_id][task_type].popleft()
+                            task_products.append(rework_job["product_id"])
+                            from_loc = rework_job["from"]
+                        else: # Feeder and Finisher
+                            while len(task_products) < AGV_CAPACITY and self.task_queues[line_id][task_type]:
+                                task_products.append(self.task_queues[line_id][task_type].popleft())
+                        
+                        if task_products:
+                            self.agv_jobs[agv_id] = {
+                                "products": task_products,
+                                "from": from_loc, "to": to_loc,
+                                "step": "start",
+                                "last_updated": time.time()
+                            }
+                            logger.info(f"【任务分配-动态】AGV {agv_id} 分配到 {task_type} 任务: 运送 {len(task_products)} 个产品 ({', '.join(task_products)}) 从 {from_loc} 到 {to_loc}")
+                            self.execute_next_step(agv_id)
+                            assigned = True
+                            break
+                if assigned: break
+            if assigned: continue
+
+    def is_destination_ok(self, line_id: str, to_loc_name: str) -> bool:
+        """[NEW] Checks if a destination device is operational and not full."""
+        # Find the device ID based on the to_loc_name (e.g., StationA, Warehouse)
+        device_id = None
+        if to_loc_name == "StationA": device_id = f"{line_id}_StationA"
+        elif to_loc_name == "StationB": device_id = f"{line_id}_StationB"
+        elif to_loc_name == "Warehouse": device_id = "Warehouse" # Global device
+        
+        if not device_id or device_id not in self.device_states:
+            return True # If we don't have state info, assume it's OK
+
+        state = self.device_states[device_id]
+        if state.get("status") == "fault":
+            return False
+        if len(state.get("buffer", [])) >= AGV_CAPACITY: # Simplified check
+            return False
+        return True
+
+    def get_task_locations(self, task_type: str, line_id: str) -> Tuple[str, str]:
+        """[NEW] Helper to get from/to locations based on task type."""
+        if task_type == "feeder": return "RawMaterial", "StationA"
+        if task_type == "finisher": return "QualityCheck_output", "Warehouse"
+        if task_type == "rework":
+            # This is a bit tricky as the specific from_loc is in the task item
+            # We'll return a placeholder and the actual from_loc is taken from the job item
+            return "Conveyor_CQ", "StationB" 
+        return "", ""
 
     def execute_next_step(self, full_agv_id: str):
-        """Manages the multi-step execution of a job for an AGV."""
         job, agv_state = self.agv_jobs.get(full_agv_id), self.agv_states[full_agv_id]
         if not job: self.schedule_tasks(); return
 
         line_id, agv_id = agv_state["line_id"], agv_state["agv_id"]
         from_loc, to_loc, products = job["from"], job["to"], job["products"]
-        step, pickup_point, dropoff_point = job["step"], LOCATION_MAPPING[from_loc], LOCATION_MAPPING[to_loc]
+        
+        # Use .get() with a default for locations not in the main mapping
+        pickup_point = LOCATION_MAPPING.get(from_loc, "P_UNKNOWN")
+        dropoff_point = LOCATION_MAPPING.get(to_loc, "P_UNKNOWN")
 
+        if pickup_point == "P_UNKNOWN" or dropoff_point == "P_UNKNOWN":
+            logger.error(f"无法为任务 {job} 找到路径点。From: {from_loc}, To: {to_loc}")
+            # Cleanup failed job
+            del self.agv_jobs[full_agv_id]
+            return
+
+        step = job["step"]
+
+        # The state machine logic remains largely the same
         if step == "start":
             job["step"] = "moving_to_pickup"
             logger.info(f"  [步骤 1] AGV {full_agv_id}: 前往取货点 {pickup_point} ({from_loc})")
             self.send_move_command(line_id, agv_id, pickup_point)
-        
         elif step == "moving_to_pickup" and agv_state["current_point"] == pickup_point:
             job["step"] = "loading"
             logger.info(f"  [步骤 2] AGV {full_agv_id}: 到达取货点，开始装载 {len(products)} 个产品")
             self.send_load_command(line_id, agv_id, products[0] if from_loc == "RawMaterial" else None)
-
         elif step == "loading":
             if len(agv_state["payload"]) < len(products):
                 next_product_idx = len(agv_state["payload"])
@@ -210,12 +323,10 @@ class TaskScheduler:
                 job["step"] = "moving_to_dropoff"
                 logger.info(f"  [步骤 3] AGV {full_agv_id}: 装载完成，前往卸货点 {dropoff_point} ({to_loc})")
                 self.send_move_command(line_id, agv_id, dropoff_point)
-
         elif step == "moving_to_dropoff" and agv_state["current_point"] == dropoff_point:
             job["step"] = "unloading"
             logger.info(f"  [步骤 4] AGV {full_agv_id}: 到达卸货点，开始卸载")
             self.send_unload_command(line_id, agv_id)
-
         elif step == "unloading":
             if agv_state["payload"]:
                 logger.info(f"  [步骤 4.{len(products) - len(agv_state['payload'])}] AGV {full_agv_id}: 继续卸载")
@@ -224,48 +335,47 @@ class TaskScheduler:
                 logger.info(f"【任务完成】AGV {full_agv_id} 完成了运送 {', '.join(products)} 的任务。")
                 for pid in products: self.tasks_created_for_product.discard(pid)
                 del self.agv_jobs[full_agv_id]
-                self.schedule_tasks()
+                # After finishing a job, check for charging needs before scheduling next one
+                if not self.check_and_start_proactive_charging(full_agv_id):
+                    self.schedule_tasks()
         
-        # Update timestamp for job progress tracking
         if full_agv_id in self.agv_jobs:
             self.agv_jobs[full_agv_id]["last_updated"] = time.time()
 
     def cleanup_stuck_jobs(self):
-        """Finds and cleans up jobs that have been stuck for too long."""
+        """[MODIFIED] Finds and cleans up stuck jobs, requeuing to the correct dynamic queue."""
         now = time.time()
-        stuck_agvs = [
-            agv_id for agv_id, job in self.agv_jobs.items()
-            if now - job.get("last_updated", now) > JOB_TIMEOUT_SECONDS
-        ]
+        stuck_agvs = [agv_id for agv_id, job in self.agv_jobs.items() if now - job.get("last_updated", now) > JOB_TIMEOUT_SECONDS]
 
         for agv_id in stuck_agvs:
             job = self.agv_jobs[agv_id]
             logger.warning(f"【任务超时】AGV {agv_id} 任务卡住，正在清理。Job: {job}")
 
-            # Safely get line_id and role for rescheduling
             state = self.agv_states.get(agv_id)
-            if not state:
-                logger.error(f"无法为 AGV {agv_id} 找到状态，无法重新调度产品。")
-                continue
+            if not state: logger.error(f"无法为 AGV {agv_id} 找到状态，无法重新调度产品。"); continue
             
             line_id = state.get("line_id")
-            role = state.get("role")
+            from_loc = job.get("from")
+            task_type = None
+            if from_loc == "RawMaterial": task_type = "feeder"
+            elif from_loc == "QualityCheck_output": task_type = "finisher"
+            elif from_loc.startswith("Conveyor_CQ"): task_type = "rework"
 
-            # Re-add products to the front of the appropriate task queue
-            for product_id in job.get("products", []):
-                self.tasks_created_for_product.discard(product_id)
-                if role == "feeder" and line_id in self.feeder_tasks:
-                    self.feeder_tasks[line_id].appendleft(product_id)
-                elif role == "finisher" and line_id in self.finisher_tasks:
-                    self.finisher_tasks[line_id].appendleft(product_id)
+            if task_type and line_id in self.task_queues:
+                for product_id in reversed(job.get("products", [])):
+                    self.tasks_created_for_product.discard(product_id)
+                    if task_type == "rework":
+                        self.task_queues[line_id][task_type].appendleft({"product_id": product_id, "from": from_loc, "to": job.get("to")})
+                    else:
+                        self.task_queues[line_id][task_type].appendleft(product_id)
 
-            # Remove the stuck job
             del self.agv_jobs[agv_id]
             logger.info(f"【任务清理】AGV {agv_id} 的任务已重置，产品已返回队列。")
     
+    # --- Command Sending ---
     def _send_command(self, line_id: str, command: Dict[str, Any]):
         topic = f"{self.topic_root}/command/{line_id}"
-        command_id = f"{command['action']}_{command['target']}_{int(time.time() * 1000)}"
+        command_id = f"{command['action']}_{command.get('target', 'N/A')}_{int(time.time() * 1000)}"
         payload = json.dumps({"command_id": command_id, **command})
         logger.info(f"发布指令到 '{topic}': {payload}")
         self.client.publish(topic, payload, qos=1)
@@ -278,8 +388,12 @@ class TaskScheduler:
 
     def send_unload_command(self, line_id: str, agv_id: str):
         self._send_command(line_id, {"action": "unload", "target": agv_id, "params": {}})
+    
+    def send_charge_command(self, line_id: str, agv_id: str, target_level: float):
+        self._send_command(line_id, {"action": "charge", "target": agv_id, "params": {"target_level": target_level}})
 
     def calculate_and_save_kpi(self):
+        # This function remains unchanged.
         if not self.latest_kpi_data: logger.warning("没有KPI数据，无法生成报告。"); return
         kpis = self.latest_kpi_data
         logger.info("正在计算最终KPI得分并生成报告...")
@@ -305,12 +419,12 @@ class TaskScheduler:
         except IOError as e: logger.error(f"无法写入KPI报告文件 {filename}: {e}")
 
     def run_forever(self):
-        logger.info("任务调度Agent已启动... (按 Ctrl+C 停止)")
-        self.client.loop_start()  # Use non-blocking loop
+        logger.info("增强版任务调度Agent已启动... (按 Ctrl+C 停止)")
+        self.client.loop_start()
         try:
             while True:
                 self.cleanup_stuck_jobs()
-                time.sleep(10)  # Check for stuck jobs every 10 seconds
+                time.sleep(10)
         except KeyboardInterrupt:
             logger.info("Agent被手动中断，正在关闭...")
         finally:
@@ -320,5 +434,5 @@ class TaskScheduler:
             logger.info("MQTT已断开连接。")
 
 if __name__ == "__main__":
-    scheduler = TaskScheduler(MQTT_BROKER_HOST, MQTT_BROKER_PORT, TOPIC_ROOT)
+    scheduler = EnhancedTaskScheduler(MQTT_BROKER_HOST, MQTT_BROKER_PORT, TOPIC_ROOT)
     scheduler.run_forever()
