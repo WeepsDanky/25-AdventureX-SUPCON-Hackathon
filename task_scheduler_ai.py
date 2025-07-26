@@ -5,6 +5,7 @@ import logging
 import time
 import uuid
 import threading
+import re
 from datetime import datetime
 from collections import deque, defaultdict
 from typing import Dict, Any, Optional, List, Tuple
@@ -123,13 +124,14 @@ class BaseAgent:
         self.connect()
         self.client.loop_forever()
 
-# --- 资源 Agent ---
+# --- [已修复] 资源 Agent ---
 class ResourceAgent(BaseAgent):
     def __init__(self, agent_id: str, line_id: str, device_name: str, topic_root: str):
         super().__init__(agent_id, "Resource", topic_root)
         self.line_id = line_id
         self.device_name = device_name
         self.published_tasks = set()
+        self.product_outcomes = {} # [新增] 用于存储质检结果
         if self.device_name == "RawMaterial":
             self.line_cycler = cycle(FACTORY_LINES)
         
@@ -140,32 +142,58 @@ class ResourceAgent(BaseAgent):
         }
         self.subscribe(topic_map[self.device_name], self.handle_status_update)
 
+    # [已修改] 增强 handle_status_update 以处理返工逻辑
     def handle_status_update(self, topic: str, payload: dict):
-        products = []
         if self.device_name == "RawMaterial":
             products = [p for p in payload.get("buffer", []) if p not in self.published_tasks]
             if products:
                 target_line = next(self.line_cycler)
                 self._create_and_publish_task("feeder", products, "RawMaterial", "StationA", target_line)
+                for p_id in products: self.published_tasks.add(p_id)
+
         elif self.device_name == "QualityCheck":
-            products = [p for p in payload.get("output_buffer", []) if p not in self.published_tasks]
-            if products: self._create_and_publish_task("finisher", products, "QualityCheck_output", "Warehouse", self.line_id)
+            # 1. 从消息中解析产品结果
+            message = payload.get("message", "")
+            rework_match = re.search(r"(prod_\d_[a-f0-9]+) reworked", message)
+            pass_match = re.search(r"(prod_\d_[a-f0-9]+) passed", message)
+            
+            if rework_match:
+                self.product_outcomes[rework_match.group(1)] = "rework"
+            elif pass_match:
+                self.product_outcomes[pass_match.group(1)] = "pass"
+
+            # 2. 逐一处理 output_buffer 中的新产品
+            all_products_in_buffer = payload.get("output_buffer", [])
+            new_products = [p for p in all_products_in_buffer if p not in self.published_tasks]
+
+            for p_id in new_products:
+                outcome = self.product_outcomes.get(p_id, "pass") # 默认为合格
+                
+                if outcome == "rework":
+                    logger.info(f"【智能分拣】[{self.agent_id}] 检测到返工产品 {p_id}，创建返工任务。")
+                    self._create_and_publish_task("rework", [p_id], "QualityCheck_output", "StationB", self.line_id)
+                else: # 'pass'
+                    logger.info(f"【智能分拣】[{self.agent_id}] 检测到合格产品 {p_id}，创建入库任务。")
+                    self._create_and_publish_task("finisher", [p_id], "QualityCheck_output", "Warehouse", self.line_id)
+                
+                self.published_tasks.add(p_id)
+                
         elif self.device_name == "Conveyor_CQ":
             products = [p for p in payload.get("upper_buffer", []) + payload.get("lower_buffer", []) if p not in self.published_tasks]
-            if products: self._create_and_publish_task("rework", products, "Conveyor_CQ", "StationB", self.line_id)
-        
-        for prod_id in products: self.published_tasks.add(prod_id)
+            if products: 
+                self._create_and_publish_task("rework", products, "Conveyor_CQ", "StationB", self.line_id)
+                for p_id in products: self.published_tasks.add(p_id)
 
     def _create_and_publish_task(self, task_type: str, products: List[str], from_loc: str, to_loc: str, target_line: str):
         task_id = f"task_{self.device_name.lower()}_{uuid.uuid4().hex[:8]}"
         task = {
             "task_id": task_id, "source_agent": self.agent_id, "line_id": target_line,
             "task_type": task_type, "products": products, "from_loc": from_loc,
-            "to_loc": to_loc, "priority": "high" if task_type == "finisher" else "normal",
+            "to_loc": to_loc, "priority": "high" if task_type in ["finisher", "rework"] else "normal",
             "creation_time": time.time()
         }
         publish_topic = f"{self.topic_root}/{target_line}/tasks/new"
-        logger.info(f"【任务分派】[{self.agent_id}] 向产线 {target_line} 发布新任务: {task_id} (产品: {products})")
+        logger.info(f"【任务分派】[{self.agent_id}] 向产线 {target_line} 发布新任务: {task_id} (类型: {task_type}, 产品: {products})")
         self.publish(publish_topic, task)
 
 # --- 协调 Agent ---
@@ -211,7 +239,7 @@ class CoordinatorAgent(BaseAgent):
         with self.lock:
             tasks_for_agv = [
                 task for task in self.open_tasks.values() 
-                if task['line_id'] == agv_line
+                if task['line_id'] == agv_line and time.time() < task.get("bidding_deadline", 0)
             ]
         
         if tasks_for_agv:
@@ -316,6 +344,7 @@ class AGVAgent(BaseAgent):
         self.line_id = line_id
         self.llm = llm
         self.state = "initializing"
+        self.idle_since = time.time() # [新增] 记录进入 idle 状态的时间
         self.task_step = None
         self.current_task = None
         self.agv_sim_state = {}
@@ -342,13 +371,10 @@ class AGVAgent(BaseAgent):
             self.set_state("idle")
             logger.info(f"[{self.agent_id}] 进入 IDLE 状态。")
         
-        # [核心修复] 区分任务性移动和自主移动的完成
         if self.state == "working" and sim_status == "idle":
             if self.current_task:
-                # 如果有关联任务，则按任务步骤执行
                 self.execute_task_step()
             else:
-                # 如果没有关联任务（说明是返回待命点等自主移动），则直接转换为空闲状态
                 logger.info(f"[{self.agent_id}] 已到达目标点 (无任务)，转换为空闲状态。")
                 self.set_state("idle")
 
@@ -359,8 +385,8 @@ class AGVAgent(BaseAgent):
     def set_state(self, new_state: str):
         if self.state != new_state:
             self.state = new_state
-            # 每当 AGV 进入空闲状态，都广播其可用性，触发“主动寻源”
             if new_state == "idle":
+                self.idle_since = time.time() # [修改] 记录进入 idle 的时间点
                 self.publish(f"{self.topic_root}/agents/available", {"agv_id": self.agent_id})
 
     def handle_new_task_announcement(self, topic: str, payload: dict):
@@ -407,10 +433,12 @@ class AGVAgent(BaseAgent):
             self.task_step = "start"
             self.execute_task_step()
 
+    # [已修改] 增强 idle 状态下的自主行为循环，引入“聆听窗口”
     def run(self):
         threading.Thread(target=super().run, daemon=True).start()
+        IDLE_LISTEN_WINDOW_SECONDS = 3.0 # 定义聆听窗口时长
+
         while True:
-            # 仅在获取到仿真器状态后才执行逻辑
             if self.agv_sim_state:
                 if self.state == "idle":
                     # 1. 最高优先级：检查电量
@@ -418,13 +446,13 @@ class AGVAgent(BaseAgent):
                         logger.info(f"🔋[{self.agent_id}] 电量低 ({self.agv_sim_state.get('battery_level', 100):.1f}%)，主动进入充电状态。")
                         self.set_state("charging")
                         self.send_charge_command()
-                    # 2. 第二优先级：检查是否在待命点
+                    # 2. 第二优先级：如果不在待命点，先“聆听”任务，超时后再返回
                     elif self.agv_sim_state.get("current_point") != self.staging_point:
-                        logger.info(f"[{self.agent_id}] 空闲中，自动返回待命点 {self.staging_point}")
-                        # 使用 "working" 状态表示正在执行内部移动任务，但没有 current_task
-                        self.set_state("working") 
-                        line_id, agv_id_suffix = self.agent_id.split('_', 1)
-                        self.send_move_command(line_id, agv_id_suffix, self.staging_point)
+                        if time.time() - self.idle_since > IDLE_LISTEN_WINDOW_SECONDS:
+                            logger.info(f"[{self.agent_id}] 空闲且聆听超时，自动返回待命点 {self.staging_point}")
+                            self.set_state("working") 
+                            line_id, agv_id_suffix = self.agent_id.split('_', 1)
+                            self.send_move_command(line_id, agv_id_suffix, self.staging_point)
                 
                 elif self.state == "bidding" and time.time() > self.bidding_timeout:
                     logger.warning(f"[{self.agent_id}] 投标超时，返回 IDLE 状态。")
@@ -462,7 +490,6 @@ class AGVAgent(BaseAgent):
             return float('inf')
             
         total_task_time = time_to_pickup + time_to_dropoff
-        
         total_task_distance = total_task_time * self.AGV_SPEED_MPS
         estimated_consumption = (total_task_distance * self.AGV_BATTERY_CONSUMPTION_PER_METER) + (2 * self.AGV_BATTERY_CONSUMPTION_PER_ACTION)
 
@@ -477,7 +504,6 @@ class AGVAgent(BaseAgent):
 
         time_cost = total_task_time * self.BID_SCORE_TRAVEL_TIME_WEIGHT
         energy_cost = estimated_consumption * self.BID_SCORE_ENERGY_WEIGHT
-        
         final_score = time_cost + energy_cost
         
         logger.debug(f"[{self.agent_id}] 为任务 {task['task_id']} 计算报价: 分数={final_score:.2f} (时间成本={time_cost:.2f}, 能源成本={energy_cost:.2f})")
@@ -490,7 +516,6 @@ class AGVAgent(BaseAgent):
             "Key factors: proximity (how close you are) and capability (battery, status). "
             "Respond ONLY with 'YES' or 'NO' and a brief, concise reason."
         )
-
         prompt = (
             f"--- My Current State ---\n"
             f"Agent ID: {self.agent_id}\n"
@@ -503,7 +528,6 @@ class AGVAgent(BaseAgent):
             f"--- Decision ---\n"
             f"Should I bid on this task?"
         )
-        
         return self.llm.ask_kimi(prompt, system_prompt)
 
     def execute_task_step(self):
@@ -515,13 +539,18 @@ class AGVAgent(BaseAgent):
         
         pickup_point = LOCATION_MAPPING.get(task['from_loc'])
         dropoff_point = LOCATION_MAPPING.get(task['to_loc'])
+        current_point = agv_sim_state.get("current_point")
 
         if self.task_step == "start":
             self.task_step = "moving_to_pickup"
             logger.info(f"  [步骤 1] AGV {self.agent_id}: 前往取货点 {pickup_point} ({task['from_loc']})")
-            self.send_move_command(line_id, agv_id_suffix, pickup_point)
+            if current_point == pickup_point:
+                logger.info(f"  -> 已在取货点，跳过移动。")
+                self.execute_task_step() # 立即处理下一个步骤
+            else:
+                self.send_move_command(line_id, agv_id_suffix, pickup_point)
 
-        elif self.task_step == "moving_to_pickup" and agv_sim_state.get("current_point") == pickup_point:
+        elif self.task_step == "moving_to_pickup" and current_point == pickup_point:
             self.task_step = "loading"
             logger.info(f"  [步骤 2] AGV {self.agent_id}: 到达取货点，开始装载")
             self.send_load_command(line_id, agv_id_suffix, task['products'][0] if task['from_loc'] == "RawMaterial" else None)
@@ -529,9 +558,13 @@ class AGVAgent(BaseAgent):
         elif self.task_step == "loading" and len(agv_sim_state.get("payload", [])) > 0:
             self.task_step = "moving_to_dropoff"
             logger.info(f"  [步骤 3] AGV {self.agent_id}: 装载完成，前往卸货点 {dropoff_point} ({task['to_loc']})")
-            self.send_move_command(line_id, agv_id_suffix, dropoff_point)
+            if current_point == dropoff_point:
+                logger.info(f"  -> 已在卸货点，跳过移动。")
+                self.execute_task_step() # 立即处理下一个步骤
+            else:
+                self.send_move_command(line_id, agv_id_suffix, dropoff_point)
 
-        elif self.task_step == "moving_to_dropoff" and agv_sim_state.get("current_point") == dropoff_point:
+        elif self.task_step == "moving_to_dropoff" and current_point == dropoff_point:
             self.task_step = "unloading"
             logger.info(f"  [步骤 4] AGV {self.agent_id}: 到达卸货点，开始卸载")
             self.send_unload_command(line_id, agv_id_suffix)
