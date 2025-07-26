@@ -336,13 +336,22 @@ class AGVAgent(BaseAgent):
     def handle_status_update(self, topic: str, payload: dict):
         self.agv_sim_state = payload
         
-        if self.state == "initializing" and payload.get("status") == "idle":
+        sim_status = payload.get("status")
+        
+        if self.state == "initializing" and sim_status == "idle":
             self.set_state("idle")
             logger.info(f"[{self.agent_id}] 进入 IDLE 状态。")
         
-        if self.state == "working" and payload.get("status") == "idle":
-            self.execute_task_step()
-        
+        # [核心修复] 区分任务性移动和自主移动的完成
+        if self.state == "working" and sim_status == "idle":
+            if self.current_task:
+                # 如果有关联任务，则按任务步骤执行
+                self.execute_task_step()
+            else:
+                # 如果没有关联任务（说明是返回待命点等自主移动），则直接转换为空闲状态
+                logger.info(f"[{self.agent_id}] 已到达目标点 (无任务)，转换为空闲状态。")
+                self.set_state("idle")
+
         if self.state == "charging" and payload.get("battery_level", 0) >= TARGET_CHARGE_LEVEL:
             logger.info(f"🔋[{self.agent_id}] 充电完成。")
             self.set_state("idle")
@@ -350,6 +359,7 @@ class AGVAgent(BaseAgent):
     def set_state(self, new_state: str):
         if self.state != new_state:
             self.state = new_state
+            # 每当 AGV 进入空闲状态，都广播其可用性，触发“主动寻源”
             if new_state == "idle":
                 self.publish(f"{self.topic_root}/agents/available", {"agv_id": self.agent_id})
 
@@ -397,7 +407,6 @@ class AGVAgent(BaseAgent):
             self.task_step = "start"
             self.execute_task_step()
 
-    # [已修改] 增强 idle 状态下的自主行为循环
     def run(self):
         threading.Thread(target=super().run, daemon=True).start()
         while True:
@@ -406,18 +415,16 @@ class AGVAgent(BaseAgent):
                 if self.state == "idle":
                     # 1. 最高优先级：检查电量
                     if self.agv_sim_state.get("battery_level", 100) < LOW_BATTERY_THRESHOLD:
-                        logger.info(f"🔋[{self.agent_id}] 电量低，主动进入充电状态。")
+                        logger.info(f"🔋[{self.agent_id}] 电量低 ({self.agv_sim_state.get('battery_level', 100):.1f}%)，主动进入充电状态。")
                         self.set_state("charging")
                         self.send_charge_command()
                     # 2. 第二优先级：检查是否在待命点
                     elif self.agv_sim_state.get("current_point") != self.staging_point:
                         logger.info(f"[{self.agent_id}] 空闲中，自动返回待命点 {self.staging_point}")
-                        self.set_state("working") # 使用 "working" 状态来表示正在执行内部移动任务
+                        # 使用 "working" 状态表示正在执行内部移动任务，但没有 current_task
+                        self.set_state("working") 
                         line_id, agv_id_suffix = self.agent_id.split('_', 1)
                         self.send_move_command(line_id, agv_id_suffix, self.staging_point)
-                    # 3. 如果一切就绪，则保持空闲并定期广播自己的可用性
-                    else:
-                        self.set_state("idle")
                 
                 elif self.state == "bidding" and time.time() > self.bidding_timeout:
                     logger.warning(f"[{self.agent_id}] 投标超时，返回 IDLE 状态。")
@@ -432,7 +439,6 @@ class AGVAgent(BaseAgent):
             "status": self.state, "data": self.agv_sim_state
         })
 
-    # [已修改] 修复路径计算 Bug
     def calculate_bid_score(self, task: dict) -> float:
         current_point = self.agv_sim_state.get("current_point")
         battery_level = self.agv_sim_state.get("battery_level", 0)
@@ -448,7 +454,6 @@ class AGVAgent(BaseAgent):
             logger.error(f"[{self.agent_id}] 任务 {task['task_id']} 包含无效的位置信息。")
             return float('inf')
 
-        # [修复] 如果 AGV 已在取货点，行驶时间为0
         time_to_pickup = 0.0 if current_point == pickup_point else get_travel_time(current_point, pickup_point)
         time_to_dropoff = get_travel_time(pickup_point, dropoff_point)
         
@@ -462,7 +467,7 @@ class AGVAgent(BaseAgent):
         estimated_consumption = (total_task_distance * self.AGV_BATTERY_CONSUMPTION_PER_METER) + (2 * self.AGV_BATTERY_CONSUMPTION_PER_ACTION)
 
         time_to_charge = get_travel_time(dropoff_point, charge_point)
-        if time_to_charge < 0: time_to_charge = 30.0
+        if time_to_charge < 0: time_to_charge = 30.0 # Fallback
         
         reserve_battery = (time_to_charge * self.AGV_SPEED_MPS * self.AGV_BATTERY_CONSUMPTION_PER_METER)
         
@@ -537,8 +542,6 @@ class AGVAgent(BaseAgent):
             self.current_task = None
             self.task_step = None
             self.set_state("idle")
-            
-            # 任务完成后，后续决策由主 run 循环处理（返回待命点）
             
     def send_move_command(self, line_id: str, agv_id: str, target_point: str):
         self._send_command(line_id, {"action": "move", "target": agv_id, "params": {"target_point": target_point}})
