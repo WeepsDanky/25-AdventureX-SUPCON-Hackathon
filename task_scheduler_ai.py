@@ -441,23 +441,17 @@ class AGVAgent(BaseAgent):
         
         task_type = payload.get("task_type")
         
-        is_my_task = False
-        if self.role == "feeder" and task_type == "feeder":
-            is_my_task = True
-        elif self.role == "finisher" and task_type in ["finisher", "rework"]:
-            is_my_task = True
+        is_my_task = (self.role == "feeder" and task_type == "feeder") or \
+                     (self.role == "finisher" and task_type in ["finisher", "rework"])
             
         if not is_my_task:
             logger.debug(f"[{self.agent_id}] 忽略任务 {payload['task_id']} (类型: {task_type}), 与角色 {self.role} 不匹配。")
             return
 
-        should_bid = False
-        if task_type in ["finisher", "rework"]:
-            logger.info(f"[{self.agent_id}] 收到关键 '{task_type}' 任务 {payload['task_id']}，将自动投标。")
-            should_bid = True
-        else:
-            decision = self.llm_decide_to_bid(payload)
-            should_bid = "YES" in decision or "ERROR_LLM" in decision
+        should_bid = True # 简化决策，总是投标
+        if task_type == "feeder":
+             decision = self.llm_decide_to_bid(payload)
+             should_bid = "YES" in decision or "ERROR_LLM" in decision
 
         if should_bid:
             bid_score = self.calculate_bid_score(payload)
@@ -466,7 +460,7 @@ class AGVAgent(BaseAgent):
                 self.bidding_timeout = time.time() + 5
                 self.publish(f"{self.topic_root}/tasks/bids", {"task_id": payload['task_id'], "agv_id": self.agent_id, "bid_score": bid_score})
                 logger.info(f"[{self.agent_id}] 对任务 {payload['task_id']} 投标，进入 BIDDING 状态。")
-        elif task_type not in ["finisher", "rework"]:
+        elif task_type == "feeder":
             logger.info(f"[{self.agent_id}] LLM 决策不对任务 {payload['task_id']} 投标: {decision}")
 
     def handle_assignment(self, topic: str, payload: dict):
@@ -518,8 +512,7 @@ class AGVAgent(BaseAgent):
         current_point = self.agv_sim_state.get("current_point")
         battery_level = self.agv_sim_state.get("battery_level", 0)
         
-        if not current_point or battery_level == 0:
-            return float('inf')
+        if not current_point or battery_level == 0: return float('inf')
 
         try:
             pickup_point = LOCATION_MAPPING[task['from_loc']]
@@ -532,29 +525,22 @@ class AGVAgent(BaseAgent):
         time_to_pickup = 0.0 if current_point == pickup_point else get_travel_time(current_point, pickup_point)
         time_to_dropoff = get_travel_time(pickup_point, dropoff_point)
         
-        if time_to_pickup < 0 or time_to_dropoff < 0:
-            logger.warning(f"[{self.agent_id}] 无法计算任务 {task['task_id']} 的路径。(从 {current_point} 到 {pickup_point} 再到 {dropoff_point})")
-            return float('inf')
+        if time_to_pickup < 0 or time_to_dropoff < 0: return float('inf')
             
         total_task_time = time_to_pickup + time_to_dropoff
         total_task_distance = total_task_time * self.AGV_SPEED_MPS
         estimated_consumption = (total_task_distance * self.AGV_BATTERY_CONSUMPTION_PER_METER) + (2 * self.AGV_BATTERY_CONSUMPTION_PER_ACTION)
 
         time_to_charge = get_travel_time(dropoff_point, charge_point)
-        if time_to_charge < 0: time_to_charge = 30.0 # Fallback
+        if time_to_charge < 0: time_to_charge = 30.0
         
         reserve_battery = (time_to_charge * self.AGV_SPEED_MPS * self.AGV_BATTERY_CONSUMPTION_PER_METER)
         
         if battery_level < estimated_consumption + reserve_battery + 5.0:
-            logger.info(f"[{self.agent_id}] 因电量不足而放弃任务 {task['task_id']}。需要: {estimated_consumption + reserve_battery + 5.0:.1f}%, 现有: {battery_level:.1f}%")
+            logger.info(f"[{self.agent_id}] 因电量不足而放弃任务 {task['task_id']}。")
             return float('inf')
 
-        time_cost = total_task_time * self.BID_SCORE_TRAVEL_TIME_WEIGHT
-        energy_cost = estimated_consumption * self.BID_SCORE_ENERGY_WEIGHT
-        final_score = time_cost + energy_cost
-        
-        logger.debug(f"[{self.agent_id}] 为任务 {task['task_id']} 计算报价: 分数={final_score:.2f} (时间成本={time_cost:.2f}, 能源成本={energy_cost:.2f})")
-        return final_score
+        return (total_task_time * self.BID_SCORE_TRAVEL_TIME_WEIGHT) + (estimated_consumption * self.BID_SCORE_ENERGY_WEIGHT)
 
     def llm_decide_to_bid(self, task: dict) -> str:
         system_prompt = (
