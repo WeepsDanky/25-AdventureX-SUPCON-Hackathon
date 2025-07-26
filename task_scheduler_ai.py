@@ -41,7 +41,7 @@ LOCATION_MAPPING = {
 }
 LOW_BATTERY_THRESHOLD = 35.0
 TARGET_CHARGE_LEVEL = 90.0
-BIDDING_WINDOW_SECONDS = 2.0
+BIDDING_WINDOW_SECONDS = 7.0
 
 # --- LLM 辅助模块 ---
 class LLMHelper:
@@ -132,6 +132,12 @@ class ResourceAgent(BaseAgent):
         self.device_name = device_name
         self.published_tasks = set()
         self.product_outcomes = {} # [新增] 用于存储质检结果
+        # [新增] 为任务打包添加缓冲区、计时器和锁
+        self.pending_products = deque()
+        self.bundling_timer: Optional[threading.Timer] = None
+        self.bundling_window = 1.5  # 等待1.5秒以打包更多产品
+        self.lock = threading.Lock()
+        
         if self.device_name == "RawMaterial":
             self.line_cycler = cycle(FACTORY_LINES)
         
@@ -142,47 +148,68 @@ class ResourceAgent(BaseAgent):
         }
         self.subscribe(topic_map[self.device_name], self.handle_status_update)
 
-    # [已修改] 增强 handle_status_update 以处理返工逻辑
     def handle_status_update(self, topic: str, payload: dict):
         if self.device_name == "RawMaterial":
             products = [p for p in payload.get("buffer", []) if p not in self.published_tasks]
-            if products:
-                target_line = next(self.line_cycler)
-                self._create_and_publish_task("feeder", products, "RawMaterial", "StationA", target_line)
-                for p_id in products: self.published_tasks.add(p_id)
+            # [修改] 将产品按2个一组进行打包
+            for i in range(0, len(products), 2):
+                product_chunk = products[i:i+2]
+                if product_chunk:
+                    target_line = next(self.line_cycler)
+                    self._create_and_publish_task("feeder", product_chunk, "RawMaterial", "StationA", target_line)
+                    for p_id in product_chunk: self.published_tasks.add(p_id)
 
         elif self.device_name == "QualityCheck":
-            # 1. 从消息中解析产品结果
-            message = payload.get("message", "")
-            rework_match = re.search(r"(prod_\d_[a-f0-9]+) reworked", message)
-            pass_match = re.search(r"(prod_\d_[a-f0-9]+) passed", message)
+            message = payload.get("message")
+            if message:
+                rework_match = re.search(r"(prod_\d_[a-f0-9]+) reworked", message)
+                pass_match = re.search(r"(prod_\d_[a-f0-9]+) passed", message)
+                if rework_match: self.product_outcomes[rework_match.group(1)] = "rework"
+                elif pass_match: self.product_outcomes[pass_match.group(1)] = "pass"
+
+            new_products = [p for p in payload.get("output_buffer", []) if p not in self.published_tasks]
             
-            if rework_match:
-                self.product_outcomes[rework_match.group(1)] = "rework"
-            elif pass_match:
-                self.product_outcomes[pass_match.group(1)] = "pass"
+            with self.lock:
+                for p_id in new_products:
+                    self.published_tasks.add(p_id) 
+                    outcome = self.product_outcomes.get(p_id, "pass")
+                    self.pending_products.append((p_id, outcome))
+                
+                # [修改] 使用计时器延迟发布任务，以实现打包
+                if self.pending_products and not (self.bundling_timer and self.bundling_timer.is_alive()):
+                    self.bundling_timer = threading.Timer(self.bundling_window, self._process_pending_products)
+                    self.bundling_timer.start()
 
-            # 2. 逐一处理 output_buffer 中的新产品
-            all_products_in_buffer = payload.get("output_buffer", [])
-            new_products = [p for p in all_products_in_buffer if p not in self.published_tasks]
-
-            for p_id in new_products:
-                outcome = self.product_outcomes.get(p_id, "pass") # 默认为合格
-                
-                if outcome == "rework":
-                    logger.info(f"【智能分拣】[{self.agent_id}] 检测到返工产品 {p_id}，创建返工任务。")
-                    self._create_and_publish_task("rework", [p_id], "QualityCheck_output", "StationB", self.line_id)
-                else: # 'pass'
-                    logger.info(f"【智能分拣】[{self.agent_id}] 检测到合格产品 {p_id}，创建入库任务。")
-                    self._create_and_publish_task("finisher", [p_id], "QualityCheck_output", "Warehouse", self.line_id)
-                
-                self.published_tasks.add(p_id)
-                
         elif self.device_name == "Conveyor_CQ":
             products = [p for p in payload.get("upper_buffer", []) + payload.get("lower_buffer", []) if p not in self.published_tasks]
-            if products: 
-                self._create_and_publish_task("rework", products, "Conveyor_CQ", "StationB", self.line_id)
-                for p_id in products: self.published_tasks.add(p_id)
+            # [修改] 将返工产品按2个一组进行打包
+            for i in range(0, len(products), 2):
+                product_chunk = products[i:i+2]
+                if product_chunk:
+                    self._create_and_publish_task("rework", product_chunk, "Conveyor_CQ", "StationB", self.line_id)
+                    for p_id in product_chunk: self.published_tasks.add(p_id)
+
+    # [新增] 新方法，用于处理计时器到期后的打包任务
+    def _process_pending_products(self):
+        with self.lock:
+            if not self.pending_products:
+                return
+
+            to_warehouse = [p[0] for p in self.pending_products if p[1] == 'pass']
+            to_rework = [p[0] for p in self.pending_products if p[1] == 'rework']
+            self.pending_products.clear()
+
+            for i in range(0, len(to_warehouse), 2):
+                chunk = to_warehouse[i:i+2]
+                if chunk:
+                    logger.info(f"【任务打包】[{self.agent_id}] 创建 {len(chunk)} 个产品的入库任务。")
+                    self._create_and_publish_task("finisher", chunk, "QualityCheck_output", "Warehouse", self.line_id)
+
+            for i in range(0, len(to_rework), 2):
+                chunk = to_rework[i:i+2]
+                if chunk:
+                    logger.info(f"【任务打包】[{self.agent_id}] 创建 {len(chunk)} 个产品的返工任务。")
+                    self._create_and_publish_task("rework", chunk, "QualityCheck_output", "StationB", self.line_id)
 
     def _create_and_publish_task(self, task_type: str, products: List[str], from_loc: str, to_loc: str, target_line: str):
         task_id = f"task_{self.device_name.lower()}_{uuid.uuid4().hex[:8]}"
@@ -248,28 +275,38 @@ class CoordinatorAgent(BaseAgent):
                 repost_topic = f"{self.topic_root}/{agv_line}/tasks/new"
                 self.publish(repost_topic, task)
 
+    # [已修复] 修正拍卖和任务清理逻辑
     def auction_tasks(self):
         while True:
-            time.sleep(0.5)
+            time.sleep(2)
             with self.lock:
-                tasks_to_assign = [task_id for task_id, task in self.open_tasks.items() if time.time() > task["bidding_deadline"]]
+                # 找出所有已过竞标截止时间的任务
+                tasks_to_assign = [task_id for task_id, task in self.open_tasks.items() if time.time() > task.get("bidding_deadline", 0)]
 
                 for task_id in tasks_to_assign:
                     task_info = self.open_tasks.get(task_id)
-                    if task_info is None:
+                    if not task_info:
                         continue
                         
+                    # 检查是否有AGV对该任务进行了投标
                     if task_id in self.bids and self.bids[task_id]:
+                        # --- 情况1：任务成功分配 ---
                         best_bid = min(self.bids[task_id], key=lambda x: x['bid_score'])
                         assignment = {"task_id": task_id, "assigned_agv_id": best_bid['agv_id'], **task_info}
                         self.publish(f"{self.topic_root}/tasks/assignments", assignment)
                         logger.info(f"【任务分配】任务 {task_id} 分配给 AGV {best_bid['agv_id']} (最优报价: {best_bid['bid_score']:.2f})")
+                        
+                        # 清理已成功分配的任务和相关的投标
+                        del self.open_tasks[task_id]
+                        del self.bids[task_id]
                     else:
+                        # --- 情况2：任务无人投标，进行重新招标 ---
                         task_info["bidding_deadline"] = time.time() + BIDDING_WINDOW_SECONDS
                         logger.info(f"【任务看板】任务 {task_id} 无人投标，重新招标。")
-                    
-                    if task_id in self.open_tasks: del self.open_tasks[task_id]
-                    if task_id in self.bids: del self.bids[task_id]
+                        
+                        # 清理可能存在的（空的）投标列表，但 **保留 open_tasks 中的任务**
+                        if task_id in self.bids:
+                            del self.bids[task_id]
 
     def calculate_and_save_kpi(self):
         if not self.latest_kpi_data: 
@@ -338,6 +375,11 @@ class AGVAgent(BaseAgent):
     BID_SCORE_TRAVEL_TIME_WEIGHT = 1.0
     BID_SCORE_ENERGY_WEIGHT = 0.5
 
+    # [新增] 一个属性，用于从仿真状态中安全地获取AGV的容量
+    @property
+    def agv_capacity(self) -> int:
+        return self.agv_sim_state.get("payload_capacity", 2)  # 默认为2
+
     def __init__(self, line_id: str, agv_id_suffix: str, topic_root: str, llm: LLMHelper):
         agent_id = f"{line_id}_{agv_id_suffix}"
         super().__init__(agent_id, "AGV", topic_root)
@@ -353,10 +395,14 @@ class AGVAgent(BaseAgent):
         if agv_id_suffix == "AGV_1":
             self.role = "feeder"
             self.staging_point = LOCATION_MAPPING["RawMaterial"]
-        else:
+            self.low_battery_threshold = 35.0  # 为 feeder 设置独立的充电阈值
+        else: # AGV_2
             self.role = "finisher"
-            self.staging_point = LOCATION_MAPPING["Charging"]
-        logger.info(f"[{self.agent_id}] 初始化完成，角色: {self.role}，待命点: {self.staging_point}")
+            # [修复] 将 finisher 的待命点从充电站(P10)改为任务源头(P8)
+            self.staging_point = LOCATION_MAPPING["QualityCheck_output"]
+            self.low_battery_threshold = 50.0  # 为 finisher 设置更高的独立充电阈值
+
+        logger.info(f"[{self.agent_id}] 初始化完成，角色: {self.role}，待命点: {self.staging_point}，低电量阈值: {self.low_battery_threshold}%")
         
         self.subscribe(f"{self.topic_root}/{line_id}/agv/{agv_id_suffix}/status", self.handle_status_update)
         self.subscribe(f"{self.topic_root}/tasks/assignments", self.handle_assignment)
@@ -442,7 +488,8 @@ class AGVAgent(BaseAgent):
             if self.agv_sim_state:
                 if self.state == "idle":
                     # 1. 最高优先级：检查电量
-                    if self.agv_sim_state.get("battery_level", 100) < LOW_BATTERY_THRESHOLD:
+                    # [修复] 使用实例变量 self.low_battery_threshold 替代全局常量
+                    if self.agv_sim_state.get("battery_level", 100) < self.low_battery_threshold:
                         logger.info(f"🔋[{self.agent_id}] 电量低 ({self.agv_sim_state.get('battery_level', 100):.1f}%)，主动进入充电状态。")
                         self.set_state("charging")
                         self.send_charge_command()
@@ -530,6 +577,7 @@ class AGVAgent(BaseAgent):
         )
         return self.llm.ask_kimi(prompt, system_prompt)
 
+    # [修改] 重写 execute_task_step 以支持批量装卸
     def execute_task_step(self):
         if not self.current_task: return
 
@@ -540,41 +588,53 @@ class AGVAgent(BaseAgent):
         pickup_point = LOCATION_MAPPING.get(task['from_loc'])
         dropoff_point = LOCATION_MAPPING.get(task['to_loc'])
         current_point = agv_sim_state.get("current_point")
+        payload_count = len(agv_sim_state.get("payload", []))
 
         if self.task_step == "start":
             self.task_step = "moving_to_pickup"
             logger.info(f"  [步骤 1] AGV {self.agent_id}: 前往取货点 {pickup_point} ({task['from_loc']})")
             if current_point == pickup_point:
                 logger.info(f"  -> 已在取货点，跳过移动。")
-                self.execute_task_step() # 立即处理下一个步骤
+                self.execute_task_step()
             else:
                 self.send_move_command(line_id, agv_id_suffix, pickup_point)
 
         elif self.task_step == "moving_to_pickup" and current_point == pickup_point:
             self.task_step = "loading"
-            logger.info(f"  [步骤 2] AGV {self.agent_id}: 到达取货点，开始装载")
-            self.send_load_command(line_id, agv_id_suffix, task['products'][0] if task['from_loc'] == "RawMaterial" else None)
+            logger.info(f"  [步骤 2] AGV {self.agent_id}: 到达取货点，开始装载序列。任务产品: {task['products']}")
+            self.execute_task_step() # 立即触发第一次装载
 
-        elif self.task_step == "loading" and len(agv_sim_state.get("payload", [])) > 0:
-            self.task_step = "moving_to_dropoff"
-            logger.info(f"  [步骤 3] AGV {self.agent_id}: 装载完成，前往卸货点 {dropoff_point} ({task['to_loc']})")
-            if current_point == dropoff_point:
-                logger.info(f"  -> 已在卸货点，跳过移动。")
-                self.execute_task_step() # 立即处理下一个步骤
+        elif self.task_step == "loading":
+            products_in_task = task['products']
+            if payload_count < self.agv_capacity and payload_count < len(products_in_task):
+                # 确定要装载的下一个产品ID（仅对RawMaterial有效）
+                product_to_load_id = products_in_task[payload_count] if task['from_loc'] == "RawMaterial" else None
+                logger.info(f"  [步骤 2.{payload_count + 1}] AGV {self.agent_id}: 装载产品 '{product_to_load_id or '下一个可用产品'}'")
+                self.send_load_command(line_id, agv_id_suffix, product_to_load_id)
             else:
-                self.send_move_command(line_id, agv_id_suffix, dropoff_point)
-
+                self.task_step = "moving_to_dropoff"
+                logger.info(f"  [步骤 3] AGV {self.agent_id}: 装载完成 (当前载重: {payload_count})，前往卸货点 {dropoff_point} ({task['to_loc']})")
+                if current_point == dropoff_point:
+                    logger.info(f"  -> 已在卸货点，跳过移动。")
+                    self.execute_task_step()
+                else:
+                    self.send_move_command(line_id, agv_id_suffix, dropoff_point)
+        
         elif self.task_step == "moving_to_dropoff" and current_point == dropoff_point:
             self.task_step = "unloading"
-            logger.info(f"  [步骤 4] AGV {self.agent_id}: 到达卸货点，开始卸载")
-            self.send_unload_command(line_id, agv_id_suffix)
-
-        elif self.task_step == "unloading" and len(agv_sim_state.get("payload", [])) == 0:
-            logger.info(f"【任务完成】AGV {self.agent_id} 完成了任务 {task['task_id']}。")
-            self.publish(f"{self.topic_root}/tasks/updates", {"task_id": task['task_id'], "agv_id": self.agent_id, "status": "completed"})
-            self.current_task = None
-            self.task_step = None
-            self.set_state("idle")
+            logger.info(f"  [步骤 4] AGV {self.agent_id}: 到达卸货点，开始卸载序列。")
+            self.execute_task_step() # 立即触发第一次卸载
+            
+        elif self.task_step == "unloading":
+            if payload_count > 0:
+                logger.info(f"  [步骤 4.{len(self.current_task['products']) - payload_count + 1}] AGV {self.agent_id}: 卸载一个产品。")
+                self.send_unload_command(line_id, agv_id_suffix)
+            else:
+                logger.info(f"【任务完成】AGV {self.agent_id} 完成了任务 {task['task_id']}。")
+                self.publish(f"{self.topic_root}/tasks/updates", {"task_id": task['task_id'], "agv_id": self.agent_id, "status": "completed"})
+                self.current_task = None
+                self.task_step = None
+                self.set_state("idle")
             
     def send_move_command(self, line_id: str, agv_id: str, target_point: str):
         self._send_command(line_id, {"action": "move", "target": agv_id, "params": {"target_point": target_point}})
