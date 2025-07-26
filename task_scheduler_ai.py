@@ -13,6 +13,8 @@ import random
 # [新增] 导入路径时间计算函数和csv模块
 from config.path_timing import get_travel_time
 import csv
+# [新增] 导入 cycle 用于轮询
+from itertools import cycle
 
 # --- 全局配置 (Global Configuration) ---
 logging.basicConfig(
@@ -121,13 +123,16 @@ class BaseAgent:
         self.connect()
         self.client.loop_forever()
 
-# --- 资源 Agent ---
+# --- 资源 Agent (修改了任务分派逻辑) ---
 class ResourceAgent(BaseAgent):
     def __init__(self, agent_id: str, line_id: str, device_name: str, topic_root: str):
         super().__init__(agent_id, "Resource", topic_root)
         self.line_id = line_id
         self.device_name = device_name
         self.published_tasks = set()
+        # [修改] 为 RawMaterial Agent 添加产线轮询器
+        if self.device_name == "RawMaterial":
+            self.line_cycler = cycle(FACTORY_LINES)
         
         topic_map = {
             "RawMaterial": f"{self.topic_root}/warehouse/RawMaterial/status",
@@ -140,43 +145,48 @@ class ResourceAgent(BaseAgent):
         products = []
         if self.device_name == "RawMaterial":
             products = [p for p in payload.get("buffer", []) if p not in self.published_tasks]
-            if products: self._create_and_publish_task("feeder", products, "RawMaterial", "StationA")
+            if products:
+                # [修改] 使用轮询策略为每个产品分配产线
+                target_line = next(self.line_cycler)
+                self._create_and_publish_task("feeder", products, "RawMaterial", "StationA", target_line)
         elif self.device_name == "QualityCheck":
             products = [p for p in payload.get("output_buffer", []) if p not in self.published_tasks]
-            if products: self._create_and_publish_task("finisher", products, "QualityCheck_output", "Warehouse")
+            if products: self._create_and_publish_task("finisher", products, "QualityCheck_output", "Warehouse", self.line_id)
         elif self.device_name == "Conveyor_CQ":
             products = [p for p in payload.get("upper_buffer", []) + payload.get("lower_buffer", []) if p not in self.published_tasks]
-            if products: self._create_and_publish_task("rework", products, "Conveyor_CQ", "StationB")
+            if products: self._create_and_publish_task("rework", products, "Conveyor_CQ", "StationB", self.line_id)
         
         for prod_id in products: self.published_tasks.add(prod_id)
 
-    def _create_and_publish_task(self, task_type: str, products: List[str], from_loc: str, to_loc: str):
+    # [修改] 增加 target_line 参数，并修改发布主题
+    def _create_and_publish_task(self, task_type: str, products: List[str], from_loc: str, to_loc: str, target_line: str):
         task_id = f"task_{self.device_name.lower()}_{uuid.uuid4().hex[:8]}"
         task = {
-            "task_id": task_id, "source_agent": self.agent_id, "line_id": self.line_id,
+            "task_id": task_id, "source_agent": self.agent_id, "line_id": target_line, # [修改] line_id 现在是具体产线
             "task_type": task_type, "products": products, "from_loc": from_loc,
             "to_loc": to_loc, "priority": "high" if task_type == "finisher" else "normal",
             "creation_time": time.time()
         }
-        logger.info(f"【任务发布】[{self.agent_id}] 发布新任务: {task_id} (产品: {products})")
-        self.publish(f"{self.topic_root}/tasks/new", task)
+        # [修改] 发布到特定产线的主题
+        publish_topic = f"{self.topic_root}/{target_line}/tasks/new"
+        logger.info(f"【任务分派】[{self.agent_id}] 向产线 {target_line} 发布新任务: {task_id} (产品: {products})")
+        self.publish(publish_topic, task)
 
-# --- 协调 Agent (新增了KPI处理) ---
+# --- 协调 Agent (现在订阅特定产线的任务) ---
 class CoordinatorAgent(BaseAgent):
     def __init__(self, topic_root: str):
         super().__init__("coordinator", "Coordinator", topic_root)
         self.open_tasks = {}
         self.bids = defaultdict(list)
         self.lock = threading.Lock()
-        self.latest_kpi_data: Optional[Dict[str, Any]] = None # [新增] 用于存储KPI数据
+        self.latest_kpi_data: Optional[Dict[str, Any]] = None
         
-        self.subscribe(f"{self.topic_root}/tasks/new", self.handle_new_task)
+        # [修改] 订阅所有产线的新任务主题
+        self.subscribe(f"{self.topic_root}/+/tasks/new", self.handle_new_task)
         self.subscribe(f"{self.topic_root}/tasks/bids", self.handle_new_bid)
-        self.subscribe(f"{self.topic_root}/kpi/status", self.handle_kpi_update) # [新增] 订阅KPI主题
+        self.subscribe(f"{self.topic_root}/kpi/status", self.handle_kpi_update)
 
-    # [新增] KPI数据处理方法
     def handle_kpi_update(self, topic: str, payload: dict):
-        """接收并存储最新的KPI数据。"""
         self.latest_kpi_data = payload
         logger.debug(f"[{self.agent_id}] 收到KPI更新数据。")
 
@@ -186,7 +196,7 @@ class CoordinatorAgent(BaseAgent):
             if task_id not in self.open_tasks:
                 payload["bidding_deadline"] = time.time() + BIDDING_WINDOW_SECONDS
                 self.open_tasks[task_id] = payload
-                logger.info(f"【任务看板】收到新任务 {task_id}，开始招标。")
+                logger.info(f"【任务看板】收到新任务 {task_id} (产线: {payload['line_id']})，开始招标。")
 
     def handle_new_bid(self, topic: str, payload: dict):
         with self.lock:
@@ -214,7 +224,6 @@ class CoordinatorAgent(BaseAgent):
                     if task_id in self.open_tasks: del self.open_tasks[task_id]
                     if task_id in self.bids: del self.bids[task_id]
 
-    # [新增] 集成KPI计算与保存功能
     def calculate_and_save_kpi(self):
         if not self.latest_kpi_data: 
             logger.warning("没有KPI数据，无法生成报告。")
@@ -222,32 +231,22 @@ class CoordinatorAgent(BaseAgent):
         kpis = self.latest_kpi_data
         logger.info("正在计算最终KPI得分并生成报告...")
         
-        # --- 权重配置 ---
         weights = {'production_efficiency': 0.4, 'quality_cost': 0.3, 'agv_efficiency': 0.3}
         efficiency_weights = {'order_completion': 0.4, 'production_cycle': 0.4, 'device_utilization': 0.2}
         quality_cost_weights = {'first_pass_rate': 0.4, 'cost_efficiency': 0.6}
         agv_weights = {'charge_strategy': 0.3, 'energy_efficiency': 0.4, 'utilization': 0.3}
         
-        # --- 分项得分计算 ---
-        # 生产周期评分：比率越接近1越好，因此用100除以比率
         production_cycle_score = min(100, 100 / max(1, kpis.get('average_production_cycle', 1))) if kpis.get('total_products', 0) > 0 else 0
-        
-        # 成本效率评分：估算基准成本，与实际成本对比
         baseline_cost_per_product, total_products, total_cost = 25, kpis.get('total_products', 0), kpis.get('total_production_cost', 0)
         cost_efficiency_score = min(100, (baseline_cost_per_product * total_products) / max(1, total_cost) * 100) if total_products > 0 else 0
-        
-        # AGV能效比评分：原始值较小，乘以1000进行放大
         agv_energy_efficiency_score = min(100, kpis.get('agv_energy_efficiency', 0) * 1000)
 
-        # --- 总分计算 ---
         efficiency_score = (kpis.get('order_completion_rate', 0) * efficiency_weights['order_completion'] + production_cycle_score * efficiency_weights['production_cycle'] + kpis.get('device_utilization', 0) * efficiency_weights['device_utilization']) * weights['production_efficiency']
         quality_cost_score = (kpis.get('first_pass_rate', 0) * quality_cost_weights['first_pass_rate'] + cost_efficiency_score * quality_cost_weights['cost_efficiency']) * weights['quality_cost']
         agv_score = (kpis.get('charge_strategy_efficiency', 0) * agv_weights['charge_strategy'] + agv_energy_efficiency_score * agv_weights['energy_efficiency'] + kpis.get('agv_utilization', 0) * agv_weights['utilization']) * weights['agv_efficiency']
         total_score = efficiency_score + quality_cost_score + agv_score
         
-        # --- 报告生成 ---
         filename = f"kpi_results_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
-        filepath = "kpi_results"
         report_data = {
             "总得分": f"{total_score:.2f}",
             "生产效率得分 (40%)": f"{efficiency_score:.2f}",
@@ -272,7 +271,7 @@ class CoordinatorAgent(BaseAgent):
         }
         
         try:
-            with open(os.path.join(filepath,filename), 'w', newline='', encoding='utf-8-sig') as f:
+            with open(filename, 'w', newline='', encoding='utf-8-sig') as f:
                 writer = csv.writer(f)
                 writer.writerow(['KPI 指标', '值'])
                 writer.writerows(report_data.items())
@@ -295,6 +294,7 @@ class AGVAgent(BaseAgent):
     def __init__(self, line_id: str, agv_id_suffix: str, topic_root: str, llm: LLMHelper):
         agent_id = f"{line_id}_{agv_id_suffix}"
         super().__init__(agent_id, "AGV", topic_root)
+        self.line_id = line_id # [新增] 保存自身产线ID
         self.llm = llm
         self.state = "initializing"
         self.task_step = None
@@ -304,7 +304,8 @@ class AGVAgent(BaseAgent):
         
         self.subscribe(f"{self.topic_root}/{line_id}/agv/{agv_id_suffix}/status", self.handle_status_update)
         self.subscribe(f"{self.topic_root}/tasks/assignments", self.handle_assignment)
-        self.subscribe(f"{self.topic_root}/tasks/new", self.handle_new_task_announcement)
+        # [修改] AGV只订阅自己产线的任务
+        self.subscribe(f"{self.topic_root}/{self.line_id}/tasks/new", self.handle_new_task_announcement)
 
     def handle_status_update(self, topic: str, payload: dict):
         self.agv_sim_state = payload
@@ -336,6 +337,9 @@ class AGVAgent(BaseAgent):
                 logger.info(f"[{self.agent_id}] LLM 决策不对任务 {payload['task_id']} 投标: {decision}")
 
     def handle_assignment(self, topic: str, payload: dict):
+        # 增加产线匹配检查，确保不会意外收到其他产线的分配
+        if payload.get("line_id") != self.line_id:
+            return
         if self.state == "bidding" and payload["assigned_agv_id"] == self.agent_id:
             logger.info(f"🎉 [{self.agent_id}] 赢得任务 {payload['task_id']}！")
             self.state = "working"
@@ -409,8 +413,26 @@ class AGVAgent(BaseAgent):
         return final_score
 
     def llm_decide_to_bid(self, task: dict) -> str:
-        system_prompt = "You are an AGV's decision-making AI... Respond ONLY with 'YES' or 'NO' and a brief reason."
-        prompt = f"AGV State:...\nNew Task:...\nShould I bid?"
+        # [修改] 简化System Prompt，因为任务已经是定向的
+        system_prompt = (
+            "You are a decision-making AI for an AGV. Your goal is to be efficient. "
+            "You have been assigned a task on your production line. Decide if you should accept it. "
+            "Key factors: proximity (how close you are) and capability (battery, status). "
+            "Respond ONLY with 'YES' or 'NO' and a brief, concise reason."
+        )
+
+        prompt = (
+            f"--- My Current State ---\n"
+            f"Agent ID: {self.agent_id}\n"
+            f"Status: {self.state}\n"
+            f"Current Location: {self.agv_sim_state.get('current_point', 'Unknown')}\n"
+            f"Battery Level: {self.agv_sim_state.get('battery_level', 0):.1f}%\n\n"
+            f"--- New Task Details (for my line) ---\n"
+            f"{json.dumps(task, indent=2)}\n\n"
+            f"--- Decision ---\n"
+            f"Should I bid on this task?"
+        )
+        
         return self.llm.ask_kimi(prompt, system_prompt)
 
     def execute_task_step(self):
@@ -464,7 +486,7 @@ class AGVAgent(BaseAgent):
         command_id = f"cmd_{self.agent_id}_{int(time.time() * 1000)}"
         self.publish(topic, {"command_id": command_id, **command})
 
-# --- 主程序入口 (新增了关机时的KPI计算调用) ---
+# --- 主程序入口 ---
 if __name__ == "__main__":
     logger.info("启动多智能体调度系统...")
     
@@ -474,6 +496,7 @@ if __name__ == "__main__":
     coordinator = CoordinatorAgent(TOPIC_ROOT)
     agents.append(coordinator)
     
+    # [修改] RawMaterial Agent 的 line_id 设置为 'global' 仅用于标识，实际任务会分派
     resource_agents_config = [{"agent_id": "global_RawMaterial", "line_id": "global", "device_name": "RawMaterial"}]
     for line in FACTORY_LINES:
         resource_agents_config.append({"agent_id": f"{line}_QualityCheck", "line_id": line, "device_name": "QualityCheck"})
@@ -495,7 +518,6 @@ if __name__ == "__main__":
         while True: time.sleep(60)
     except KeyboardInterrupt:
         logger.info("收到关闭信号，正在停止所有智能体...")
-        # [修改] 在关闭前计算并保存KPI
         logger.info("正在生成最终KPI报告...")
         coordinator.calculate_and_save_kpi()
         
